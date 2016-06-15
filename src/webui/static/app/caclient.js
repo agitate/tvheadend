@@ -8,7 +8,7 @@ tvheadend.caclient = function(panel, index) {
         tvheadend.caclient_builders = new Ext.data.JsonStore({
             url: 'api/caclient/builders',
             root: 'entries',
-            fields: ['class', 'caption', 'props'],
+            fields: ['class', 'caption', 'order', 'groups', 'props'],
             id: 'class',
             autoLoad: true
         });
@@ -37,7 +37,8 @@ tvheadend.caclient = function(panel, index) {
         val: 'title',
         fields: ['uuid', 'title', 'status'],
         tabIndex: index,
-        uilevel: 'expert',
+        uilevel: tvheadend.capabilities.indexOf('caclient_advanced') === -1
+                 ? 'expert' : 'advanced',
         list: { url: 'api/caclient/list', params: { } },
         edit: { params: { list: list } },
         add: {
@@ -46,9 +47,9 @@ tvheadend.caclient = function(panel, index) {
             select: {
                 label: _('Type'),
                 store: tvheadend.caclient_builders,
+                fullRecord: true,
                 displayField: 'caption',
                 valueField: 'class',
-                propField: 'props',
                 list: list
             },
             create: { }
@@ -57,10 +58,7 @@ tvheadend.caclient = function(panel, index) {
         move: true,
         hidepwd: true,
         lcol: [actions],
-        plugins: [actions],
-        help: function() {
-            new tvheadend.help(_('Conditional Access Client'), 'config_caclient.html');
-        }
+        plugins: [actions]
     });
 
     return panel;

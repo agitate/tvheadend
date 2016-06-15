@@ -13,14 +13,16 @@ tvheadend.acleditor = function(panel, index)
 	       'channel_tag_exclude,channel_tag,comment';
 
     var list2 = 'enabled,username,password,prefix,' +
-                'lang,webui,langui,uilevel,uilevel_nochange,admin,' +
+                'lang,webui,themeui,langui,uilevel,uilevel_nochange,admin,' +
                 'streaming,adv_streaming,htsp_streaming,' +
                 'profile,conn_limit_type,conn_limit,' +
                 'dvr,htsp_dvr,all_dvr,all_rw_dvr,' +
-                'failed_dvr,dvr_config,channel_min,channel_max,' +
-                'channel_tag_exclude,channel_tag,comment';
+                'failed_dvr,htsp_anonymize,dvr_config,' +
+                'channel_min,channel_max,channel_tag_exclude,' +
+                'channel_tag,comment';
 
     tvheadend.idnode_grid(panel, {
+        id: 'access_entry',
         url: 'api/access/entry',
         titleS: _('Access Entry'),
         titleP: _('Access Entries'),
@@ -59,10 +61,7 @@ tvheadend.acleditor = function(panel, index)
         },
         del: true,
         move: true,
-        list: list,
-        help: function() {
-            new tvheadend.help(_('Access Control Entries'), 'config_access.html');
-        }
+        list: list
     });
 };
 
@@ -98,11 +97,7 @@ tvheadend.passwdeditor = function(panel, index)
             create: { }
         },
         del: true,
-        move: true,
-        list: list,
-        help: function() {
-            new tvheadend.help(_('Password Control Entries'), 'config_passwords.html');
-        }
+        list: list
     });
 };
 
@@ -138,9 +133,6 @@ tvheadend.ipblockeditor = function(panel, index)
             create: { }
         },
         del: true,
-        list: list,
-        help: function() {
-            new tvheadend.help(_('IP Blocking Entries'), 'config_ipblock.html');
-        }
+        list: list
     });
 };

@@ -34,20 +34,8 @@
 #include <limits.h>
 #if ENABLE_LOCKOWNER || ENABLE_ANDROID
 #include <sys/syscall.h>
-#if ENABLE_ANDROID
-#ifndef strdupa
-#define strdupa(s)                                                            \
-    ({                                                                        \
-      const char *__old = (s);                                                \
-      size_t __len = strlen(__old) + 1;                                       \
-      char *__new = (char *) alloca(__len);                                   \
-      (char *) memcpy(__new, __old, __len);                                   \
-    })
-#endif
-#endif
 #endif
 #include "queue.h"
-#include "avg.h"
 #include "hts_strtab.h"
 #include "htsmsg.h"
 #include "tvhlog.h"
@@ -68,11 +56,17 @@ typedef struct {
   const char     *name;
   const uint32_t *enabled;
 } tvh_caps_t;
+
 extern int              tvheadend_running;
 extern const char      *tvheadend_version;
 extern const char      *tvheadend_cwd;
 extern const char      *tvheadend_webroot;
 extern const tvh_caps_t tvheadend_capabilities[];
+
+static inline int tvheadend_is_running(void)
+{
+  return atomic_get(&tvheadend_running);
+}
 
 htsmsg_t *tvheadend_capabilities_list(int check);
 
@@ -86,8 +80,6 @@ typedef struct str_list
 #define PTS_UNSET INT64_C(0x8000000000000000)
 #define PTS_MASK  INT64_C(0x00000001ffffffff)
 
-extern int tvheadend_running;
-
 extern pthread_mutex_t global_lock;
 extern pthread_mutex_t tasklet_lock;
 extern pthread_mutex_t fork_lock;
@@ -95,18 +87,6 @@ extern pthread_mutex_t fork_lock;
 extern int tvheadend_webui_port;
 extern int tvheadend_webui_debug;
 extern int tvheadend_htsp_port;
-
-typedef struct source_info {
-  char *si_device;
-  char *si_adapter;
-  char *si_network;
-  char *si_satpos;
-  char *si_mux;
-  char *si_provider;
-  char *si_service;
-  int   si_type;
-} source_info_t;
-
 
 static inline void
 lock_assert0(pthread_mutex_t *l, const char *file, int line)
@@ -123,6 +103,20 @@ lock_assert0(pthread_mutex_t *l, const char *file, int line)
 }
 
 #define lock_assert(l) lock_assert0(l, __FILE__, __LINE__)
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define CLANG_SANITIZER 1
+#endif
+#endif
+
+/*
+ *
+ */
+
+typedef struct {
+  pthread_cond_t cond;
+} tvh_cond_t;
 
 
 /*
@@ -144,21 +138,21 @@ typedef enum {
 #define UILEVEL_EXPERT   2
 
 /*
- * global timer
+ *
  */
+#define CHICON_NONE      0
+#define CHICON_LOWERCASE 1
+#define CHICON_SVCNAME   2
 
-typedef void (gti_callback_t)(void *opaque);
+/*
+ *
+ */
+#define PICON_STANDARD   0
+#define PICON_ISVCTYPE   1
 
-typedef struct gtimer {
-  LIST_ENTRY(gtimer) gti_link;
-  gti_callback_t *gti_callback;
-  void *gti_opaque;
-  struct timespec gti_expire;
-#if ENABLE_GTIMER_CHECK
-  const char *gti_id;
-  const char *gti_fcn;
-#endif
-} gtimer_t;
+/*
+ * timer support functions
+ */
 
 #if ENABLE_GTIMER_CHECK
 #define GTIMER_TRACEID_ const char *id, const char *fcn,
@@ -168,20 +162,62 @@ typedef struct gtimer {
 #define GTIMER_FCN(n) n
 #endif
 
-void GTIMER_FCN(gtimer_arm)
-  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, int delta);
-void GTIMER_FCN(gtimer_arm_ms)
-  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, long delta_ms);
-void GTIMER_FCN(gtimer_arm_abs)
-  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, time_t when);
-void GTIMER_FCN(gtimer_arm_abs2)
-  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, struct timespec *when);
+/*
+ * global timer - monotonic
+ */
+
+typedef void (mti_callback_t)(void *opaque);
+
+typedef struct mtimer {
+  LIST_ENTRY(mtimer) mti_link;
+  mti_callback_t *mti_callback;
+  void *mti_opaque;
+  int64_t mti_expire;
+#if ENABLE_GTIMER_CHECK
+  const char *mti_id;
+  const char *mti_fcn;
+#endif
+} mtimer_t;
+
+void GTIMER_FCN(mtimer_arm_rel)
+  (GTIMER_TRACEID_ mtimer_t *mti, mti_callback_t *callback, void *opaque, int64_t delta);
+void GTIMER_FCN(mtimer_arm_abs)
+  (GTIMER_TRACEID_ mtimer_t *mti, mti_callback_t *callback, void *opaque, int64_t when);
 
 #if ENABLE_GTIMER_CHECK
-#define gtimer_arm(a, b, c, d) GTIMER_FCN(gtimer_arm)(SRCLINEID(), __func__, a, b, c, d)
-#define gtimer_arm_ms(a, b, c, d) GTIMER_FCN(gtimer_arm_ms)(SRCLINEID(), __func__, a, b, c, d)
-#define gtimer_arm_abs(a, b, c, d) GTIMER_FCN(gtimer_arm_abs)(SRCLINEID(), __func__, a, b, c, d)
-#define gtimer_arm_abs2(a, b, c, d) GTIMER_FCN(gtimer_arm_abs2)(SRCLINEID(), __func__, a, b, c, d)
+#define mtimer_arm_rel(a, b, c, d) GTIMER_FCN(mtimer_arm_rel)(SRCLINEID(), __func__, a, b, c, d)
+#define mtimer_arm_abs(a, b, c, d) GTIMER_FCN(mtimer_arm_abs)(SRCLINEID(), __func__, a, b, c, d)
+#endif
+
+void mtimer_disarm(mtimer_t *mti);
+
+
+
+/*
+ * global timer (based on the current system time - time())
+ */
+
+typedef void (gti_callback_t)(void *opaque);
+
+typedef struct gtimer {
+  LIST_ENTRY(gtimer) gti_link;
+  gti_callback_t *gti_callback;
+  void *gti_opaque;
+  time_t gti_expire;
+#if ENABLE_GTIMER_CHECK
+  const char *gti_id;
+  const char *gti_fcn;
+#endif
+} gtimer_t;
+
+void GTIMER_FCN(gtimer_arm_rel)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, time_t delta);
+void GTIMER_FCN(gtimer_arm_absn)
+  (GTIMER_TRACEID_ gtimer_t *gti, gti_callback_t *callback, void *opaque, time_t when);
+
+#if ENABLE_GTIMER_CHECK
+#define gtimer_arm_rel(a, b, c, d) GTIMER_FCN(gtimer_arm_rel)(SRCLINEID(), __func__, a, b, c, d)
+#define gtimer_arm_absn(a, b, c, d) GTIMER_FCN(gtimer_arm_absn)(SRCLINEID(), __func__, a, b, c, d)
 #endif
 
 void gtimer_disarm(gtimer_t *gti);
@@ -208,8 +244,10 @@ void tasklet_disarm(tasklet_t *gti);
 /*
  * List / Queue header declarations
  */
+LIST_HEAD(memoryinfo_list, memoryinfo);
 LIST_HEAD(access_entry_list, access_entry);
 LIST_HEAD(th_subscription_list, th_subscription);
+LIST_HEAD(dvr_vfs_list, dvr_vfs);
 LIST_HEAD(dvr_config_list, dvr_config);
 LIST_HEAD(dvr_entry_list, dvr_entry);
 TAILQ_HEAD(ref_update_queue, ref_update);
@@ -309,6 +347,17 @@ typedef struct descramble_info {
 } descramble_info_t;
 
 /**
+ *
+ */
+typedef struct timeshift_status
+{
+  int     full;
+  int64_t shift;
+  int64_t pts_start;
+  int64_t pts_end;
+} timeshift_status_t;
+
+/**
  * Streaming skip
  */
 typedef struct streaming_skip
@@ -325,6 +374,9 @@ typedef struct streaming_skip
     off_t   size;
     int64_t time;
   };
+#if ENABLE_TIMESHIFT
+  timeshift_status_t timeshift;
+#endif
 } streaming_skip_t;
 
 
@@ -466,6 +518,7 @@ typedef enum {
 #define SM_CODE_USER_ACCESS               105
 #define SM_CODE_USER_LIMIT                106
 #define SM_CODE_WEAK_STREAM               107
+#define SM_CODE_USER_REQUEST              108
 
 #define SM_CODE_NO_FREE_ADAPTER           200
 #define SM_CODE_MUX_NOT_ENABLED           201
@@ -477,6 +530,7 @@ typedef enum {
 #define SM_CODE_NO_SERVICE                207
 #define SM_CODE_NO_VALID_ADAPTER          208
 #define SM_CODE_NO_ADAPTERS               209
+#define SM_CODE_INVALID_SERVICE           210
 
 #define SM_CODE_ABORTED                   300
 
@@ -514,7 +568,7 @@ typedef struct streaming_message {
   TAILQ_ENTRY(streaming_message) sm_link;
   streaming_message_type_t sm_type;
 #if ENABLE_TIMESHIFT
-  int64_t  sm_time;
+  int64_t sm_time;
 #endif
   union {
     void *sm_data;
@@ -546,7 +600,7 @@ typedef struct streaming_queue {
   streaming_target_t sq_st;
 
   pthread_mutex_t sq_mutex;    /* Protects sp_queue */
-  pthread_cond_t  sq_cond;     /* Condvar for signalling new packets */
+  tvh_cond_t  sq_cond;         /* Condvar for signalling new packets */
 
   size_t          sq_maxsize;  /* Max queue size (bytes) */
   size_t          sq_size;     /* Actual queue size (bytes) - only data */
@@ -589,37 +643,8 @@ static inline unsigned int tvh_strhash(const char *s, unsigned int mod)
 void tvh_str_set(char **strp, const char *src);
 int tvh_str_update(char **strp, const char *src);
 
-#ifndef CLOCK_MONOTONIC_COARSE
-#define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
-#endif
-
-#ifdef PLATFORM_DARWIN
-#define CLOCK_MONOTONIC 0 
-#define CLOCK_REALTIME 0
-
-static inline int clock_gettime(int clk_id, struct timespec* t) {
-    struct timeval now;
-    int rv = gettimeofday(&now, NULL);
-    if (rv) return rv;
-    t->tv_sec  = now.tv_sec;
-    t->tv_nsec = now.tv_usec * 1000;
-    return 0;
-}
-#endif
-
-static inline int64_t 
-getmonoclock(void)
-{
-  struct timespec tp;
-
-  clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
-
-  return tp.tv_sec * 1000000ULL + (tp.tv_nsec / 1000);
-}
-
 int sri_to_rate(int sri);
 int rate_to_sri(int rate);
-
 
 extern struct service_list all_transports;
 
@@ -636,6 +661,8 @@ extern void scopedunlock(pthread_mutex_t **mtxp);
   ({ int tvh_l = strlen(n); \
      char *tvh_b = alloca(tvh_l + 1); \
      memcpy(tvh_b, n, tvh_l + 1); })
+
+#define tvh_strlen(s) ((s) ? strlen(s) : 0)
 
 #define tvh_strlcatf(buf, size, ptr, fmt...) \
   do { int __r = snprintf((buf) + ptr, (size) - ptr, fmt); \
@@ -668,6 +695,20 @@ int tvhthread_create
    void *(*start_routine) (void *), void *arg,
    const char *name);
 
+int tvhtread_renice(int value);
+
+int tvh_mutex_timedlock(pthread_mutex_t *mutex, int64_t usec);
+
+int tvh_cond_init(tvh_cond_t *cond);
+
+int tvh_cond_destroy(tvh_cond_t *cond);
+
+int tvh_cond_signal(tvh_cond_t *cond, int broadcast);
+
+int tvh_cond_wait(tvh_cond_t *cond, pthread_mutex_t *mutex);
+
+int tvh_cond_timedwait(tvh_cond_t *cond, pthread_mutex_t *mutex, int64_t monoclock);
+
 int tvh_open(const char *pathname, int flags, mode_t mode);
 
 int tvh_socket(int domain, int type, int protocol);
@@ -699,7 +740,7 @@ static inline int64_t ts_rescale(int64_t ts, int tb)
   return (ts * tb ) / 90000LL;
 }
 
-static inline int64_t ts_rescale_i(int64_t ts, int tb)
+static inline int64_t ts_rescale_inv(int64_t ts, int tb)
 {
   return (ts * 90000LL) / tb;
 }
@@ -763,9 +804,9 @@ uint32_t sbuf_peek_u32be(sbuf_t *sb, int off);
 static inline  int32_t sbuf_peek_s32be(sbuf_t *sb, int off) { return sbuf_peek_u32be(sb, off); }
 static inline uint8_t *sbuf_peek(sbuf_t *sb, int off) { return sb->sb_data + off; }
 
-char *md5sum ( const char *str );
+char *md5sum ( const char *str, int lowercase );
 
-int makedirs ( const char *path, int mode, gid_t gid, uid_t uid );
+int makedirs ( const char *subsys, const char *path, int mode, int mstrict, gid_t gid, uid_t uid );
 
 int rmtree ( const char *path );
 
@@ -774,6 +815,8 @@ char *regexp_escape ( const char *str );
 #if ENABLE_ZLIB
 uint8_t *tvh_gzip_inflate ( const uint8_t *data, size_t size, size_t orig );
 uint8_t *tvh_gzip_deflate ( const uint8_t *data, size_t orig, size_t *size );
+int      tvh_gzip_deflate_fd ( int fd, const uint8_t *data, size_t orig, size_t *size, int speed );
+int      tvh_gzip_deflate_fd_header ( int fd, const uint8_t *data, size_t orig, int speed );
 #endif
 
 /* URL decoding */

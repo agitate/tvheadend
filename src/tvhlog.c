@@ -30,8 +30,6 @@
 #include "libav.h"
 #include "webui/webui.h"
 
-time_t                   dispatch_clock;
-
 int                      tvhlog_run;
 int                      tvhlog_level;
 int                      tvhlog_options;
@@ -40,7 +38,7 @@ htsmsg_t                *tvhlog_debug;
 htsmsg_t                *tvhlog_trace;
 pthread_t                tvhlog_tid;
 pthread_mutex_t          tvhlog_mutex;
-pthread_cond_t           tvhlog_cond;
+tvh_cond_t               tvhlog_cond;
 TAILQ_HEAD(,tvhlog_msg)  tvhlog_queue;
 int                      tvhlog_queue_size;
 int                      tvhlog_queue_full;
@@ -237,7 +235,7 @@ tvhlog_thread ( void *p )
                     // but overall performance will be higher
         fp = NULL;
       }
-      pthread_cond_wait(&tvhlog_cond, &tvhlog_mutex);
+      tvh_cond_wait(&tvhlog_cond, &tvhlog_mutex);
       continue;
     }
     TAILQ_REMOVE(&tvhlog_queue, msg, link);
@@ -285,7 +283,7 @@ void tvhlogv ( const char *file, int line,
   options = tvhlog_options;
   if (severity >= LOG_DEBUG) {
     ok = 0;
-    if (severity <= tvhlog_level) {
+    if (severity <= atomic_get(&tvhlog_level)) {
       if (tvhlog_trace) {
         ok = htsmsg_get_u32_or_default(tvhlog_trace, "all", 0);
         ok = htsmsg_get_u32_or_default(tvhlog_trace, subsys, ok);
@@ -336,7 +334,7 @@ void tvhlogv ( const char *file, int line,
   if (tvhlog_run) {
     TAILQ_INSERT_TAIL(&tvhlog_queue, msg, link);
     tvhlog_queue_size++;
-    pthread_cond_signal(&tvhlog_cond);
+    tvh_cond_signal(&tvhlog_cond, 0);
   } else {
 #endif
     FILE *fp = NULL;
@@ -438,13 +436,14 @@ tvhlog_init ( int level, int options, const char *path )
   tvhlog_run     = 1;
   openlog("tvheadend", LOG_PID, LOG_DAEMON);
   pthread_mutex_init(&tvhlog_mutex, NULL);
-  pthread_cond_init(&tvhlog_cond, NULL);
+  tvh_cond_init(&tvhlog_cond);
   TAILQ_INIT(&tvhlog_queue);
 }
 
 void
 tvhlog_start ( void )
 {
+  idclass_register(&tvhlog_conf_class);
   tvhthread_create(&tvhlog_tid, NULL, tvhlog_thread, NULL, "log");
 }
 
@@ -455,7 +454,7 @@ tvhlog_end ( void )
   tvhlog_msg_t *msg;
   pthread_mutex_lock(&tvhlog_mutex);
   tvhlog_run = 0;
-  pthread_cond_signal(&tvhlog_cond);
+  tvh_cond_signal(&tvhlog_cond, 0);
   pthread_mutex_unlock(&tvhlog_mutex);
   pthread_join(tvhlog_tid, NULL);
   pthread_mutex_lock(&tvhlog_mutex);
@@ -476,10 +475,6 @@ tvhlog_end ( void )
 /*
  * Configuration
  */
-
-static void tvhlog_class_save(idnode_t *self)
-{
-}
 
 static const void *
 tvhlog_class_path_get ( void *o )
@@ -579,19 +574,14 @@ static const void *
 tvhlog_class_trace_get ( void *o )
 {
   static int si;
-  si = tvhlog_level >= LOG_TRACE;
+  si = atomic_get(&tvhlog_level) >= LOG_TRACE;
   return &si;
 }
 
 static int
 tvhlog_class_trace_set ( void *o, const void *v )
 {
-  pthread_mutex_lock(&tvhlog_mutex);
-  if (*(int *)v)
-    tvhlog_level = LOG_TRACE;
-  else
-    tvhlog_level = LOG_DEBUG;
-  pthread_mutex_unlock(&tvhlog_mutex);
+  atomic_set(&tvhlog_level, *(int *)v ? LOG_TRACE : LOG_DEBUG);
   return 1;
 }
 
@@ -620,13 +610,15 @@ idnode_t tvhlog_conf = {
   .in_class      = &tvhlog_conf_class
 };
 
+CLASS_DOC(debugging)
+
 const idclass_t tvhlog_conf_class = {
   .ic_snode      = &tvhlog_conf,
   .ic_class      = "tvhlog_conf",
   .ic_caption    = N_("Debugging"),
+  .ic_doc        = tvh_doc_debugging_class,
   .ic_event      = "tvhlog_conf",
   .ic_perm_def   = ACCESS_ADMIN,
-  .ic_save       = tvhlog_class_save,
   .ic_groups     = (const property_group_t[]) {
     {
       .name   = N_("Settings"),
@@ -639,6 +631,9 @@ const idclass_t tvhlog_conf_class = {
       .type   = PT_STR,
       .id     = "path",
       .name   = N_("Debug log path"),
+      /* Should this really be called Debug log path? Don't you need to
+       * enter a filename here not just a path? */
+      .desc   = N_("Enter a filename you want to save the debug log to."),
       .get    = tvhlog_class_path_get,
       .set    = tvhlog_class_path_set,
       .group  = 1,
@@ -647,6 +642,7 @@ const idclass_t tvhlog_conf_class = {
       .type   = PT_BOOL,
       .id     = "enable_syslog",
       .name   = N_("Enable syslog"),
+      .desc   = N_("Enable/disable logging to syslog."),
       .get    = tvhlog_class_enable_syslog_get,
       .set    = tvhlog_class_enable_syslog_set,
       .group  = 1,
@@ -655,6 +651,7 @@ const idclass_t tvhlog_conf_class = {
       .type   = PT_BOOL,
       .id     = "syslog",
       .name   = N_("Debug to syslog"),
+      .desc   = N_("Enable/disable debugging output to syslog."),
       .get    = tvhlog_class_debug_syslog_get,
       .set    = tvhlog_class_debug_syslog_set,
       .group  = 1,
@@ -663,14 +660,19 @@ const idclass_t tvhlog_conf_class = {
       .type   = PT_STR,
       .id     = "debugsubs",
       .name   = N_("Debug subsystems"),
+      .desc   = N_("Enter comma-separated list of subsystems you want "
+                   "debugging output for (e.g "
+                   "+linuxdvb,+subscriptions,+mpegts)."),
       .get    = tvhlog_class_debugsubs_get,
       .set    = tvhlog_class_debugsubs_set,
+      .opts   = PO_MULTILINE,
       .group  = 1,
     },
     {
       .type   = PT_BOOL,
       .id     = "trace",
       .name   = N_("Debug trace (low-level)"),
+      .desc   = N_("Enable/disable inclusion of low-level debug traces."),
       .get    = tvhlog_class_trace_get,
       .set    = tvhlog_class_trace_set,
 #if !ENABLE_TRACE
@@ -682,10 +684,14 @@ const idclass_t tvhlog_conf_class = {
       .type   = PT_STR,
       .id     = "tracesubs",
       .name   = N_("Trace subsystems"),
+      .desc   = N_("Enter comma-separated list of subsystems you want "
+                   "to get traces for (e.g +linuxdvb,+subscriptions,+mpegts)."),
       .get    = tvhlog_class_tracesubs_get,
       .set    = tvhlog_class_tracesubs_set,
 #if !ENABLE_TRACE
-      .opts   = PO_RDONLY | PO_HIDDEN,
+      .opts   = PO_RDONLY | PO_HIDDEN |  PO_MULTILINE,
+#else
+      .opts   = PO_MULTILINE,
 #endif
       .group  = 1,
     },
@@ -693,6 +699,7 @@ const idclass_t tvhlog_conf_class = {
       .type   = PT_BOOL,
       .id     = "libav",
       .name   = N_("Debug libav log"),
+      .desc   = N_("Enable/disable libav log output."),
       .get    = tvhlog_class_libav_get,
       .set    = tvhlog_class_libav_set,
       .group  = 1,

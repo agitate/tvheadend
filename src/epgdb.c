@@ -31,6 +31,8 @@
 #include "channels.h"
 #include "epg.h"
 #include "epggrab.h"
+#include "config.h"
+#include "memoryinfo.h"
 
 #define EPG_DB_VERSION 2
 #define EPG_DB_ALLOC_STEP (1024*1024)
@@ -146,6 +148,125 @@ _epgdb_v2_process( char **sect, htsmsg_t *m, epggrab_stats_t *stats )
 }
 
 /*
+ * Memoryinfo
+ */
+
+static void epg_memoryinfo_brands_update(memoryinfo_t *my)
+{
+  epg_object_t *eo;
+  epg_brand_t *eb;
+  int64_t size = 0, count = 0;
+
+  RB_FOREACH(eo, &epg_brands, uri_link) {
+    eb = (epg_brand_t *)eo;
+    size += sizeof(*eb);
+    size += tvh_strlen(eb->uri);
+    size += lang_str_size(eb->title);
+    size += lang_str_size(eb->summary);
+    size += tvh_strlen(eb->image);
+    count++;
+  }
+  memoryinfo_update(my, size, count);
+}
+
+static memoryinfo_t epg_memoryinfo_brands = {
+  .my_name = "EPG Brands",
+  .my_update = epg_memoryinfo_brands_update
+};
+
+static void epg_memoryinfo_seasons_update(memoryinfo_t *my)
+{
+  epg_object_t *eo;
+  epg_season_t *es;
+  int64_t size = 0, count = 0;
+
+  RB_FOREACH(eo, &epg_seasons, uri_link) {
+    es = (epg_season_t *)eo;
+    size += sizeof(*es);
+    size += tvh_strlen(es->uri);
+    size += lang_str_size(es->summary);
+    size += tvh_strlen(es->image);
+    count++;
+  }
+  memoryinfo_update(my, size, count);
+}
+
+static memoryinfo_t epg_memoryinfo_seasons = {
+  .my_name = "EPG Seasons",
+  .my_update = epg_memoryinfo_seasons_update
+};
+
+static void epg_memoryinfo_episodes_update(memoryinfo_t *my)
+{
+  epg_object_t *eo;
+  epg_episode_t *ee;
+  int64_t size = 0, count = 0;
+
+  RB_FOREACH(eo, &epg_episodes, uri_link) {
+    ee = (epg_episode_t *)eo;
+    size += sizeof(*ee);
+    size += tvh_strlen(ee->uri);
+    size += lang_str_size(ee->title);
+    size += lang_str_size(ee->subtitle);
+    size += lang_str_size(ee->summary);
+    size += lang_str_size(ee->description);
+    size += tvh_strlen(ee->image);
+    size += tvh_strlen(ee->epnum.text);
+    count++;
+  }
+  memoryinfo_update(my, size, count);
+}
+
+static memoryinfo_t epg_memoryinfo_episodes = {
+  .my_name = "EPG Episodes",
+  .my_update = epg_memoryinfo_episodes_update
+};
+
+static void epg_memoryinfo_serieslinks_update(memoryinfo_t *my)
+{
+  epg_object_t *eo;
+  epg_serieslink_t *es;
+  int64_t size = 0, count = 0;
+
+  RB_FOREACH(eo, &epg_serieslinks, uri_link) {
+    es = (epg_serieslink_t *)eo;
+    size += sizeof(*es);
+    size += tvh_strlen(es->uri);
+    count++;
+  }
+  memoryinfo_update(my, size, count);
+}
+
+static memoryinfo_t epg_memoryinfo_serieslinks = {
+  .my_name = "EPG Series Links",
+  .my_update = epg_memoryinfo_serieslinks_update
+};
+
+static void epg_memoryinfo_broadcasts_update(memoryinfo_t *my)
+{
+  channel_t *ch;
+  epg_broadcast_t *ebc;
+  int64_t size = 0, count = 0;
+
+  CHANNEL_FOREACH(ch) {
+    if (ch->ch_epg_parent) continue;
+    RB_FOREACH(ebc, &ch->ch_epg_schedule, sched_link) {
+      size += sizeof(*ebc);
+      size += tvh_strlen(ebc->uri);
+      size += lang_str_size(ebc->summary);
+      size += lang_str_size(ebc->description);
+      count++;
+    }
+  }
+  memoryinfo_update(my, size, count);
+}
+
+static memoryinfo_t epg_memoryinfo_broadcasts = {
+  .my_name = "EPG Broadcasts",
+  .my_update = epg_memoryinfo_broadcasts_update
+};
+
+/*
  * Recovery
  */
 static sigjmp_buf epg_mmap_env;
@@ -163,11 +284,17 @@ void epg_init ( void )
   int fd = -1;
   struct stat st;
   size_t remain;
-  uint8_t *mem, *rp;
+  uint8_t *mem, *rp, *zlib_mem = NULL;
   epggrab_stats_t stats;
   int ver = EPG_DB_VERSION;
   struct sigaction act, oldact;
   char *sect = NULL;
+
+  memoryinfo_register(&epg_memoryinfo_brands);
+  memoryinfo_register(&epg_memoryinfo_seasons);
+  memoryinfo_register(&epg_memoryinfo_episodes);
+  memoryinfo_register(&epg_memoryinfo_serieslinks);
+  memoryinfo_register(&epg_memoryinfo_broadcasts);
 
   /* Find the right file (and version) */
   while (fd < 0 && ver > 0) {
@@ -213,6 +340,16 @@ void epg_init ( void )
       munmap(mem, st.st_size);
     goto end;
   }
+
+#if ENABLE_ZLIB
+  if (remain > 12 && memcmp(rp, "\xff\xffGZIP00", 8) == 0) {
+    uint32_t orig = (rp[8] << 24) | (rp[9] << 16) | (rp[10] << 8) | rp[11];
+    tvhlog(LOG_INFO, "epgdb", "gzip format detected, inflating (ratio %.1f%%)",
+           (float)((remain * 100.0) / orig));
+    rp = zlib_mem = tvh_gzip_inflate(rp + 12, remain - 12, orig);
+    remain = rp ? orig : 0;
+  }
+#endif
 
   /* Process */
   memset(&stats, 0, sizeof(stats));
@@ -273,6 +410,7 @@ void epg_init ( void )
 
   /* Close file */
   munmap(mem, st.st_size);
+  free(zlib_mem);
 end:
   sigaction(SIGBUS, &oldact, NULL);
   close(fd);
@@ -286,6 +424,11 @@ void epg_done ( void )
   CHANNEL_FOREACH(ch)
     epg_channel_unlink(ch);
   epg_skel_done();
+  memoryinfo_unregister(&epg_memoryinfo_brands);
+  memoryinfo_unregister(&epg_memoryinfo_seasons);
+  memoryinfo_unregister(&epg_memoryinfo_episodes);
+  memoryinfo_unregister(&epg_memoryinfo_serieslinks);
+  memoryinfo_unregister(&epg_memoryinfo_broadcasts);
   pthread_mutex_unlock(&global_lock);
 }
 
@@ -325,17 +468,23 @@ static int _epg_write_sect ( sbuf_t *sb, const char *sect )
 static void epg_save_tsk_callback ( void *p, int dearmed )
 {
   sbuf_t *sb = p;
+  size_t size = sb->sb_ptr;
   int fd, r;
 
   tvhinfo("epgdb", "save start");
   fd = hts_settings_open_file(1, "epgdb.v%d", EPG_DB_VERSION);
   if (fd >= 0) {
-    r = tvh_write(fd, sb->sb_data, sb->sb_ptr);
+#if ENABLE_ZLIB
+    if (config.epg_compress) {
+      r = tvh_gzip_deflate_fd_header(fd, sb->sb_data, sb->sb_ptr, 3) < 0;
+   } else
+#endif
+      r = tvh_write(fd, sb->sb_data, sb->sb_ptr);
     close(fd);
     if (r)
-      tvherror("epgdb", "write error (size %d)", sb->sb_ptr);
+      tvherror("epgdb", "write error (size %zd)", size);
     else
-      tvhinfo("epgdb", "stored (size %d)", sb->sb_ptr);
+      tvhinfo("epgdb", "stored (size %zd)", size);
   } else
     tvherror("epgdb", "unable to open epgdb file");
   sbuf_free(sb);
@@ -364,8 +513,8 @@ void epg_save ( void )
   sbuf_init_fixed(sb, EPG_DB_ALLOC_STEP);
 
   if (epggrab_conf.epgdb_periodicsave)
-    gtimer_arm(&epggrab_save_timer, epg_save_callback, NULL,
-               epggrab_conf.epgdb_periodicsave * 3600);
+    gtimer_arm_rel(&epggrab_save_timer, epg_save_callback, NULL,
+                   epggrab_conf.epgdb_periodicsave * 3600);
 
   memset(&stats, 0, sizeof(stats));
   if ( _epg_write_sect(sb, "config") ) goto error;

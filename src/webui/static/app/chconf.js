@@ -125,14 +125,31 @@ tvheadend.channel_tab = function(panel, index)
     var mapButton = {
         name: 'map',
         builder: function() {
+            var m = new Ext.menu.Menu()
+            m.add({
+                name: 'mapsel',
+                tooltip: _('Map selected services to channels'),
+                iconCls: 'clone',
+                text: _('Map selected services'),
+            });
+            m.add({
+                name: 'mapall',
+                tooltip: _('Map all services to channels'),
+                iconCls: 'clone',
+                text: _('Map all services'),
+            });
             return new Ext.Toolbar.Button({
                 tooltip: _('Map services to channels'),
                 iconCls: 'clone',
-                text: _('Map Services'),
+                text: _('Map services'),
+                menu: m,
                 disabled: false
             });
         },
-        callback: tvheadend.service_mapper
+        callback: {
+            mapall: tvheadend.service_mapper_all,
+            mapsel: tvheadend.service_mapper_none,
+        }
     };
 
     var chopsButton = {
@@ -193,6 +210,7 @@ tvheadend.channel_tab = function(panel, index)
     };
 
     tvheadend.idnode_grid(panel, {
+        id: 'channels',
         url: 'api/channel',
         all: 1,
         comet: 'channel',
@@ -200,9 +218,6 @@ tvheadend.channel_tab = function(panel, index)
         titleP: _('Channels'),
         iconCls: 'channels',
         tabIndex: index,
-        help: function() {
-            new tvheadend.help(_('Channels'), 'config_channels.html');
-        },           
         add: {
             url: 'api/channel',
             create: {}
@@ -219,8 +234,7 @@ tvheadend.channel_tab = function(panel, index)
                     if (r.data['number'])
                       title += r.data['number'] + ' : ';
                     title += r.data['name'];
-                    return "<a href='play/stream/channel/" + r.id +
-                           "?title=" + encodeURIComponent(title) + "'>" + _('Play') + "</a>";
+                    return tvheadend.playLink('play/stream/channel/' + r.id, title);
                 }
             }
         ],

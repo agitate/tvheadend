@@ -199,6 +199,7 @@ multi:
       t = htsmsg_create_map();
       delim = 0;
       while (*data && delim != '\n' && delim != '\r') {
+        while (*data && *data <= ' ') data++;
         p = data;
         while (*data && *data >= ' ' && *data != '=') data++;
         if (*data == '=') {
@@ -271,7 +272,6 @@ multi:
       htsmsg_add_str(item, "m3u-url", get_url(buf, sizeof(buf), p, url));
     } else if (item) {
       htsmsg_destroy(item);
-      free(item);
       item = NULL;
     }
 

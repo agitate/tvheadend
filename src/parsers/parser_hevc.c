@@ -828,7 +828,7 @@ static void hvcc_init(HEVCDecoderConfigurationRecord *hvcc)
      * the ProfileTierLevel parsing code will unset them when needed.
      */
     hvcc->general_profile_compatibility_flags = 0xffffffff;
-    hvcc->general_constraint_indicator_flags  = 0xffffffffffff;
+    hvcc->general_constraint_indicator_flags  = 0xffffffffffffLL;
 
     /*
      * Initialize this field with an invalid value which can be used to detect
@@ -1178,11 +1178,7 @@ th_pkt_t *
 hevc_convert_pkt(th_pkt_t *src)
 {
   sbuf_t payload;
-  th_pkt_t *pkt = malloc(sizeof(*pkt));
-
-  *pkt = *src;
-  pkt->pkt_refcount = 1;
-  pkt->pkt_meta = NULL;
+  th_pkt_t *pkt = pkt_copy_nodata(src);
 
   sbuf_init(&payload);
 

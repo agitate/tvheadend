@@ -28,6 +28,11 @@
 
 struct access;
 typedef struct idnode idnode_t;
+typedef struct idnode_save idnode_save_t;
+
+#define IDNODE_SAVE_DELAY (3 * MONOCLOCK_RESOLUTION)
+
+#define SAVEPTR_OUTOFSERVICE ((void *)((intptr_t)-1LL))
 
 /*
  * Node set
@@ -54,22 +59,29 @@ typedef struct property_group
 /*
  * Class definition
  */
+#define IDCLASS_ALWAYS_SAVE    (1<<0)      ///< Always call the save callback
+
+#define CLASS_DOC(name) extern const char *tvh_doc_##name##_class[];
+
 typedef struct idclass idclass_t;
 struct idclass {
   const struct idclass   *ic_super;        ///< Parent class
   const char             *ic_class;        ///< Class name
   const char             *ic_caption;      ///< Class description
-  const char             *ic_order;        ///< Property order (comma separated)
+  const char             *ic_order;        ///< Property order (comma-separated)
+  const char            **ic_doc;          ///< NULL terminated array of strings
   const property_group_t *ic_groups;       ///< Groups for visual representation
   const property_t       *ic_properties;   ///< Property list
   const char             *ic_event;        ///< Events to fire on add/delete/title
   uint32_t                ic_perm_def;     ///< Default permissions
+  uint32_t                ic_flags;        ///< Extra flags
   idnode_t               *ic_snode;        ///< Simple node
 
   /* Callbacks */
   idnode_set_t   *(*ic_get_childs) (idnode_t *self);
   const char     *(*ic_get_title)  (idnode_t *self, const char *lang);
-  void            (*ic_save)       (idnode_t *self);
+  void            (*ic_changed)    (idnode_t *self);
+  htsmsg_t       *(*ic_save)       (idnode_t *self, char *filename, size_t fsize);
   void            (*ic_delete)     (idnode_t *self);
   void            (*ic_moveup)     (idnode_t *self);
   void            (*ic_movedown)   (idnode_t *self);
@@ -83,14 +95,32 @@ typedef RB_HEAD(, idnode) idnodes_rb_t;
  * Node definition
  */
 struct idnode {
-  uint8_t           in_uuid[UUID_BIN_SIZE]; ///< Unique ID
+  tvh_uuid_t        in_uuid;                ///< Unique ID
   RB_ENTRY(idnode)  in_link;                ///< Global hash
   RB_ENTRY(idnode)  in_domain_link;         ///< Root class link (domain)
   idnodes_rb_t     *in_domain;              ///< Domain nodes
   const idclass_t  *in_class;               ///< Class definition
   struct access    *in_access;              ///< Actual permissions
-
+  idnode_save_t    *in_save;                ///< Pointer to the save link
 };
+
+/*
+ * Node save list
+ */
+struct idnode_save {
+  TAILQ_ENTRY(idnode_save)  ise_link;       ///< List chain
+  idnode_t                 *ise_node;       ///< Node owning this
+  int64_t                   ise_reqtime;    ///< First request
+};
+
+/*
+ * Simple list
+ */
+typedef struct idnode_slist {
+  const char       *id;
+  const char       *name;
+  size_t            off;
+} idnode_slist_t;
 
 /*
  * Node list mapping definition
@@ -161,11 +191,10 @@ typedef struct idnode_filter_ele
 
 typedef LIST_HEAD(,idnode_filter_ele) idnode_filter_t;
 
-extern char idnode_uuid_static[UUID_HEX_SIZE];
-
 extern idnode_t tvhlog_conf;
 extern const idclass_t tvhlog_conf_class;
 
+void idnode_boot(void);
 void idnode_init(void);
 void idnode_done(void);
 
@@ -176,8 +205,6 @@ void idnode_unlink(idnode_t *in);
 
 uint32_t      idnode_get_short_uuid (const idnode_t *in);
 const char   *idnode_uuid_as_str  (const idnode_t *in, char *buf);
-static inline const char *idnode_uuid_as_sstr(const idnode_t *in)
-  { return idnode_uuid_as_str(in, idnode_uuid_static); }
 idnode_set_t *idnode_get_childs   (idnode_t *in);
 const char   *idnode_get_title    (idnode_t *in, const char *lang);
 int           idnode_is_leaf      (idnode_t *in);
@@ -198,14 +225,19 @@ void idnode_notify_title_changed (void *in, const char *lang);
 
 void idclass_register ( const idclass_t *idc );
 const idclass_t *idclass_find ( const char *name );
+idclass_t const **idclass_find_all(void);
+idclass_t const **idclass_find_children(const char *name);
+const char **idclass_get_doc(const idclass_t *idc);
 const char *idclass_get_caption ( const idclass_t *idc, const char *lang );
 htsmsg_t *idclass_serialize0 (const idclass_t *idc, htsmsg_t *list, int optmask, const char *lang);
 htsmsg_t *idnode_serialize0  (idnode_t *self, htsmsg_t *list, int optmask, const char *lang);
 void      idnode_read0  (idnode_t *self, htsmsg_t *m, htsmsg_t *list, int optmask, const char *lang);
 int       idnode_write0 (idnode_t *self, htsmsg_t *m, int optmask, int dosave);
+void      idnode_save_check (idnode_t *self, int weak);
 
-#define idclass_serialize(idc, lang) idclass_serialize0(idc, NULL, 0, lang)
-#define idnode_serialize(in, lang)   idnode_serialize0(in, NULL, 0, lang)
+#define idclass_serialize(idc, lang)    idclass_serialize0(idc, NULL, 0, lang)
+#define idclass_serializedoc(idc, lang) idclass_serialize0(idc, NULL, PO_DOC, lang)
+#define idnode_serialize(in, lang)      idnode_serialize0(in, NULL, 0, lang)
 #define idnode_load(in, m)     idnode_write0(in, m, PO_NOSAVE, 0)
 #define idnode_save(in, m)     idnode_read0(in, m, NULL, PO_NOSAVE | PO_USERAW, NULL)
 #define idnode_update(in, m)   idnode_write0(in, m, PO_RDONLY | PO_WRONCE, 1)
@@ -219,6 +251,11 @@ static inline void idnode_perm_unset(idnode_t *self) { self->in_access = NULL; }
 #define idnode_lang_ui(self) \
   (((idnode_t *)self)->in_access ? \
    ((idnode_t *)self)->in_access->aa_lang_ui : NULL)
+
+htsmsg_t * idnode_slist_enum ( idnode_t *in, idnode_slist_t *options, const char *lang );
+htsmsg_t * idnode_slist_get ( idnode_t *in, idnode_slist_t *options );
+int idnode_slist_set ( idnode_t *in, idnode_slist_t *options, const htsmsg_t *vals );
+char * idnode_slist_rend ( idnode_t *in, idnode_slist_t *options, const char *lang );
 
 idnode_list_mapping_t * idnode_list_link
                        ( idnode_t *in1, idnode_list_head_t *in1_list,
@@ -240,6 +277,7 @@ int idnode_list_set2 ( idnode_t *in2, idnode_list_head_t *in2_list,
 const char *idnode_get_str (idnode_t *self, const char *key );
 int         idnode_get_u32 (idnode_t *self, const char *key, uint32_t *u32);
 int         idnode_get_s64 (idnode_t *self, const char *key,  int64_t *s64);
+int         idnode_get_s64_atomic (idnode_t *self, const char *key, int64_t *s64);
 int         idnode_get_dbl (idnode_t *self, const char *key,   double *dbl);
 int         idnode_get_bool(idnode_t *self, const char *key, int *b);
 int         idnode_get_time(idnode_t *self, const char *key, time_t *tm);
@@ -259,6 +297,7 @@ int  idnode_filter
 static inline idnode_set_t * idnode_set_create(int sorted)
   { idnode_set_t *is = calloc(1, sizeof(idnode_set_t));
     is->is_sorted = sorted; return is; }
+void idnode_set_alloc ( idnode_set_t *is, size_t alloc );
 void idnode_set_add
   ( idnode_set_t *is, idnode_t *in, idnode_filter_t *filt, const char *lang );
 int idnode_set_remove ( idnode_set_t *is, idnode_t *in );
@@ -268,6 +307,7 @@ static inline int idnode_set_exists ( idnode_set_t *is, idnode_t *in )
 void idnode_set_sort ( idnode_set_t *is, idnode_sort_t *s );
 void idnode_set_sort_by_title ( idnode_set_t *is, const char *lang );
 htsmsg_t *idnode_set_as_htsmsg ( idnode_set_t *is );
+void idnode_set_clear ( idnode_set_t *is );
 void idnode_set_free ( idnode_set_t *is );
 
 #endif /* __TVH_IDNODE_H__ */

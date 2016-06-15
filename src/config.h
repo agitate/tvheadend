@@ -32,16 +32,22 @@ typedef struct config {
   uint32_t version;
   int uilevel;
   int uilevel_nochange;
+  int ui_quicktips;
+  int digest;
+  char *realm;
+  char *wizard;
   char *full_version;
   char *server_name;
   char *language;
   char *info_area;
   char *language_ui;
+  char *theme_ui;
   char *muxconf_path;
   int prefer_picon;
   char *chicon_path;
-  int chicon_lowercase;
+  int chicon_scheme;
   char *picon_path;
+  int picon_scheme;
   int tvhtime_update_enabled;
   int tvhtime_ntp_enabled;
   uint32_t tvhtime_tolerance;
@@ -49,6 +55,9 @@ typedef struct config {
   uint32_t cookie_expires;
   int dscp;
   uint32_t descrambler_buffer;
+  int caclient_ui;
+  int parser_backlog;
+  int epg_compress;
 } config_t;
 
 extern const idclass_t config_class;
@@ -57,7 +66,6 @@ extern config_t config;
 void        config_boot    ( const char *path, gid_t gid, uid_t uid );
 void        config_init    ( int backup );
 void        config_done    ( void );
-void        config_save    ( void );
 
 const char *config_get_server_name ( void );
 const char *config_get_language    ( void );

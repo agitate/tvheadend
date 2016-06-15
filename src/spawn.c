@@ -58,7 +58,7 @@ typedef struct spawn {
   LIST_ENTRY(spawn) link;
   pid_t pid;
   const char *name;
-  time_t killed;
+  int64_t killed;
 } spawn_t;
 
 static void spawn_reaper(void);
@@ -127,7 +127,7 @@ spawn_pipe_thread(void *aux)
   ev[1].data.ptr = &spawn_pipe_error;
   tvhpoll_add(efd, ev, 2);
 
-  while (spawn_pipe_running) {
+  while (atomic_get(&spawn_pipe_running)) {
 
     nfds = tvhpoll_wait(efd, ev, 2, 500);
 
@@ -301,7 +301,7 @@ spawn_reaper(void)
   /* forced kill for expired PIDs */
   pthread_mutex_lock(&spawn_mutex);
   LIST_FOREACH(s, &spawns, link)
-    if (s->killed && s->killed < dispatch_clock) {
+    if (s->killed && s->killed < mclk()) {
       /* kill the whole process group */
       kill(-(s->pid), SIGKILL);
     }
@@ -326,7 +326,7 @@ spawn_kill(pid_t pid, int sig, int timeout)
         break;
     if (s) {
       if (!s->killed)
-        s->killed = dispatch_clock_update(NULL) + MINMAX(timeout, 5, 3600);
+        s->killed = mclk() + sec2mono(MINMAX(timeout, 5, 3600));
       /* kill the whole process group */
       r = kill(-pid, sig);
       if (r < 0)
@@ -414,7 +414,7 @@ spawn_parse_args(char ***argv, int argc, const char *cmd, const char **replace)
           strcpy(a, f);
           strcat(a, r[1]);
           strcat(a, p + l);
-          *argv[i++] = a;
+          (*argv)[i++] = a;
           break;
         }
       }
@@ -643,17 +643,24 @@ void spawn_init(void)
 {
   tvh_pipe(O_NONBLOCK, &spawn_pipe_info);
   tvh_pipe(O_NONBLOCK, &spawn_pipe_error);
-  spawn_pipe_running = 1;
+  atomic_set(&spawn_pipe_running, 1);
   pthread_create(&spawn_pipe_tid, NULL, spawn_pipe_thread, NULL);
 }
 
 void spawn_done(void)
 {
-  spawn_pipe_running = 0;
+  spawn_t *s;
+
+  atomic_set(&spawn_pipe_running, 0);
   pthread_kill(spawn_pipe_tid, SIGTERM);
   pthread_join(spawn_pipe_tid, NULL);
   tvh_pipe_close(&spawn_pipe_error);
   tvh_pipe_close(&spawn_pipe_info);
   free(spawn_error_buf);
   free(spawn_info_buf);
+  while ((s = LIST_FIRST(&spawns)) != NULL) {
+    LIST_REMOVE(s, link);
+    free((char *)s->name);
+    free(s);
+  }
 }

@@ -31,6 +31,7 @@
 typedef struct http_priv {
   iptv_mux_t    *im;
   http_client_t *hc;
+  uint8_t        shutdown;
   uint8_t        started;
   sbuf_t         m3u_sbuf;
   sbuf_t         key_sbuf;
@@ -46,7 +47,7 @@ typedef struct http_priv {
   htsmsg_t      *hls_m3u;
   htsmsg_t      *hls_key;
   uint8_t       *hls_si;
-  time_t         hls_last_si;
+  int64_t        hls_last_si;
   struct {
     char          tmp[AES_BLOCK_SIZE];
     int           tmp_len;
@@ -63,12 +64,13 @@ static int iptv_http_complete_key ( http_client_t *hc );
  *
  */
 static int
-iptv_http_safe_global_lock( iptv_mux_t *im )
+iptv_http_safe_global_lock( http_priv_t *hp )
 {
+  iptv_mux_t *im = hp->im;
   int r;
 
   while (1) {
-    if (im->mm_active == NULL)
+    if (im->mm_active == NULL || hp->shutdown)
       return 0;
     r = pthread_mutex_trylock(&global_lock);
     if (r == 0)
@@ -76,13 +78,13 @@ iptv_http_safe_global_lock( iptv_mux_t *im )
     if (r != EBUSY)
       continue;
     sched_yield();
-    if (im->mm_active == NULL)
+    if (im->mm_active == NULL || hp->shutdown)
       return 0;
     r = pthread_mutex_trylock(&global_lock);
     if (r == 0)
       break;
     if (r == EBUSY)
-      usleep(10000);
+      tvh_safe_usleep(10000);
   }
   return 1;
 }
@@ -130,6 +132,8 @@ iptv_http_get_url( http_priv_t *hp, htsmsg_t *m )
   /*
    * extract the URL
    */
+  if (items == NULL)
+    return NULL;
   HTSMSG_FOREACH(f, items) {
     if ((item = htsmsg_field_get_map(f)) == NULL) continue;
     inf = htsmsg_get_map(item, "stream-inf");
@@ -141,7 +145,8 @@ iptv_http_get_url( http_priv_t *hp, htsmsg_t *m )
         sscanf(s, "%dx%d", &width, &height);
       if (htsmsg_get_str(item, "m3u-url"))
         if ((width == 0 && sel_bandwidth < bandwidth) ||
-            (bandwidth > 200000 && sel_width < width && sel_height < height)) {
+            (bandwidth > 200000 && sel_width < width && sel_height < height) ||
+            (sel == NULL && bandwidth > 1000)) {
           sel = item;
           sel_bandwidth = bandwidth;
           sel_width = width;
@@ -242,7 +247,7 @@ iptv_http_header ( http_client_t *hc )
 
   hp->m3u_header = 0;
   hp->off = 0;
-  if (iptv_http_safe_global_lock(hp->im)) {
+  if (iptv_http_safe_global_lock(hp)) {
     if (!hp->started) {
       iptv_input_mux_started(hp->im);
     } else {
@@ -318,14 +323,14 @@ iptv_http_data
     memcpy(hp->hls_si, buf, 2*188);
   }
 
-  if (dispatch_clock != hp->hls_last_si && hp->hls_si) {
+  if (hp->hls_last_si + sec2mono(1) <= mclk() && hp->hls_si) {
     /* do rounding to start of the last MPEG-TS packet */
     rem = 188 - (hp->off % 188);
     if (im->mm_iptv_buffer.sb_ptr >= rem) {
       im->mm_iptv_buffer.sb_ptr -= rem;
       memcpy(tsbuf, im->mm_iptv_buffer.sb_data + im->mm_iptv_buffer.sb_ptr, rem);
       sbuf_append(&im->mm_iptv_buffer, hp->hls_si, 2*188);
-      hp->hls_last_si = dispatch_clock;
+      hp->hls_last_si = mclk();
       sbuf_append(&im->mm_iptv_buffer, tsbuf, rem);
       hp->off += rem;
     }
@@ -337,9 +342,9 @@ iptv_http_data
 
   pthread_mutex_unlock(&iptv_lock);
 
-  if (pause && iptv_http_safe_global_lock(im)) {
-    if (im->mm_active)
-      gtimer_arm(&im->im_pause_timer, iptv_input_unpause, im, 1);
+  if (pause && iptv_http_safe_global_lock(hp)) {
+    if (im->mm_active && !hp->shutdown)
+      mtimer_arm_rel(&im->im_pause_timer, iptv_input_unpause, im, sec2mono(1));
     pthread_mutex_unlock(&global_lock);
   }
   return 0;
@@ -547,6 +552,7 @@ iptv_http_stop
   http_priv_t *hp = im->im_data;
 
   hp->hc->hc_aux = NULL;
+  hp->shutdown = 1;
   pthread_mutex_unlock(&iptv_lock);
   http_client_close(hp->hc);
   pthread_mutex_lock(&iptv_lock);
@@ -587,12 +593,14 @@ iptv_http_init ( void )
   static iptv_handler_t ih[] = {
     {
       .scheme = "http",
+      .buffer_limit = 5000,
       .start  = iptv_http_start,
       .stop   = iptv_http_stop,
       .pause  = iptv_http_pause
     },
     {
       .scheme  = "https",
+      .buffer_limit = 5000,
       .start  = iptv_http_start,
       .stop   = iptv_http_stop,
       .pause  = iptv_http_pause

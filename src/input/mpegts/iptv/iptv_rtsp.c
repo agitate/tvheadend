@@ -30,7 +30,7 @@ typedef struct {
   udp_multirecv_t um;
   char *path;
   char *query;
-  gtimer_t alive_timer;
+  mtimer_t alive_timer;
   int play;
   iptv_rtcp_info_t * rtcp_info;
 } rtsp_priv_t;
@@ -52,10 +52,14 @@ iptv_rtsp_alive_cb ( void *aux )
 {
   iptv_mux_t *im = aux;
   rtsp_priv_t *rp = im->im_data;
-
-  rtsp_send(rp->hc, RTSP_CMD_OPTIONS, rp->path, rp->query, NULL);
-  gtimer_arm(&rp->alive_timer, iptv_rtsp_alive_cb, im,
-             MAX(1, (rp->hc->hc_rtp_timeout / 2) - 1));
+  if(rp->hc->hc_rtsp_keep_alive_cmd == RTSP_CMD_GET_PARAMETER)
+    rtsp_get_parameter(rp->hc, "position");
+  else if(rp->hc->hc_rtsp_keep_alive_cmd == RTSP_CMD_OPTIONS)
+    rtsp_send(rp->hc, RTSP_CMD_OPTIONS, rp->path, rp->query, NULL);
+  else
+    return;
+  mtimer_arm_rel(&rp->alive_timer, iptv_rtsp_alive_cb, im,
+                 sec2mono(MAX(1, (rp->hc->hc_rtp_timeout / 2) - 1)));
 }
 
 /*
@@ -72,9 +76,16 @@ iptv_rtsp_header ( http_client_t *hc )
     /* teardown (or teardown timeout) */
     if (hc->hc_cmd == RTSP_CMD_TEARDOWN) {
       pthread_mutex_lock(&global_lock);
-      gtimer_arm(&hc->hc_close_timer, iptv_rtsp_close_cb, hc, 0);
+      mtimer_arm_rel(&hc->hc_close_timer, iptv_rtsp_close_cb, hc, 0);
       pthread_mutex_unlock(&global_lock);
     }
+    return 0;
+  }
+
+  if (hc->hc_cmd == RTSP_CMD_GET_PARAMETER && hc->hc_code != HTTP_STATUS_OK) {
+    tvhtrace("iptv", "GET_PARAMETER command returned invalid error code %d for '%s', "
+        "fall back to OPTIONS in keep alive loop.", hc->hc_code, im->mm_iptv_url_raw);
+    hc->hc_rtsp_keep_alive_cmd = RTSP_CMD_OPTIONS;
     return 0;
   }
 
@@ -102,8 +113,8 @@ iptv_rtsp_header ( http_client_t *hc )
     hc->hc_cmd = HTTP_CMD_NONE;
     pthread_mutex_lock(&global_lock);
     iptv_input_mux_started(hc->hc_aux);
-    gtimer_arm(&rp->alive_timer, iptv_rtsp_alive_cb, im,
-               MAX(1, (hc->hc_rtp_timeout / 2) - 1));
+    mtimer_arm_rel(&rp->alive_timer, iptv_rtsp_alive_cb, im,
+                   sec2mono(MAX(1, (hc->hc_rtp_timeout / 2) - 1)));
     pthread_mutex_unlock(&global_lock);
     break;
   default:
@@ -160,10 +171,11 @@ iptv_rtsp_start
     return SM_CODE_TUNING_FAILED;
   }
 
-  hc->hc_hdr_received    = iptv_rtsp_header;
-  hc->hc_data_received   = iptv_rtsp_data;
-  hc->hc_handle_location = 1;        /* allow redirects */
-  http_client_register(hc);          /* register to the HTTP thread */
+  hc->hc_hdr_received        = iptv_rtsp_header;
+  hc->hc_data_received       = iptv_rtsp_data;
+  hc->hc_handle_location     = 1;                      /* allow redirects */
+  hc->hc_rtsp_keep_alive_cmd = RTSP_CMD_GET_PARAMETER; /* start keep alive loop with GET_PARAMETER */
+  http_client_register(hc);                            /* register to the HTTP thread */
   r = rtsp_setup(hc, u->path, u->query, NULL,
                  ntohs(IP_PORT(rtp->ip)),
                  ntohs(IP_PORT(rtcp->ip)));
@@ -213,7 +225,7 @@ iptv_rtsp_stop
   if (play)
     rtsp_teardown(rp->hc, rp->path, "");
   pthread_mutex_unlock(&iptv_lock);
-  gtimer_disarm(&rp->alive_timer);
+  mtimer_disarm(&rp->alive_timer);
   udp_multirecv_free(&rp->um);
   if (!play)
     http_client_close(rp->hc);
@@ -228,27 +240,27 @@ iptv_rtsp_stop
 static void
 iptv_rtp_header_callback ( iptv_mux_t *im, uint8_t *rtp, int len )
 {
-    rtsp_priv_t *rp = im->im_data;
-    iptv_rtcp_info_t *rtcp_info = rp->rtcp_info;
-    ssize_t hlen;
-    
-    /* Basic headers checks */
-    /* Version 2 */
-    if ((rtp[0] & 0xC0) != 0x80)
-      return;
+  rtsp_priv_t *rp = im->im_data;
+  iptv_rtcp_info_t *rtcp_info = rp->rtcp_info;
+  ssize_t hlen;
 
-    /* Header length (4bytes per CSRC) */
-    hlen = ((rtp[0] & 0xf) * 4) + 12;
-    if (rtp[0] & 0x10) {
-      if (len < hlen+4)
-        return;
-      hlen += ((rtp[hlen+2] << 8) | rtp[hlen+3]) * 4;
-      hlen += 4;
-    }
-    if (len < hlen || ((len - hlen) % 188) != 0)
+  /* Basic headers checks */
+  /* Version 2 */
+  if ((rtp[0] & 0xC0) != 0x80)
+    return;
+
+  /* Header length (4bytes per CSRC) */
+  hlen = ((rtp[0] & 0xf) * 4) + 12;
+  if (rtp[0] & 0x10) {
+    if (len < hlen+4)
       return;
-    
-    rtcp_receiver_update(rtcp_info, rtp);
+    hlen += ((rtp[hlen+2] << 8) | rtp[hlen+3]) * 4;
+    hlen += 4;
+  }
+  if (len < hlen || ((len - hlen) % 188) != 0)
+    return;
+
+  rtcp_receiver_update(rtcp_info, rtp);
 }
 
 /*
@@ -283,15 +295,19 @@ iptv_rtsp_init ( void )
   static iptv_handler_t ih[] = {
     {
       .scheme = "rtsp",
+      .buffer_limit = UINT32_MAX, /* unlimited */
       .start  = iptv_rtsp_start,
       .stop   = iptv_rtsp_stop,
       .read   = iptv_rtsp_read,
+      .pause  = iptv_input_pause_handler
     },
     {
       .scheme  = "rtsps",
+      .buffer_limit = UINT32_MAX, /* unlimited */
       .start  = iptv_rtsp_start,
       .stop   = iptv_rtsp_stop,
       .read   = iptv_rtsp_read,
+      .pause  = iptv_input_pause_handler
     }
   };
   iptv_handler_register(ih, 2);

@@ -45,23 +45,30 @@ linuxdvb_frontend_input_thread ( void *aux );
  * *************************************************************************/
 
 static void
-linuxdvb_frontend_class_save ( idnode_t *in )
+linuxdvb_frontend_class_changed ( idnode_t *in )
 {
   linuxdvb_adapter_t *la = ((linuxdvb_frontend_t*)in)->lfe_adapter;
-  linuxdvb_adapter_save(la);
+  linuxdvb_adapter_changed(la);
 }
+
+CLASS_DOC(linuxdvb_frontend)
+CLASS_DOC(linuxdvb_frontend_dvbs)
+CLASS_DOC(linuxdvb_frontend_dvbt) 
+CLASS_DOC(linuxdvb_frontend_dvbc)
 
 const idclass_t linuxdvb_frontend_class =
 {
   .ic_super      = &mpegts_input_class,
   .ic_class      = "linuxdvb_frontend",
   .ic_caption    = N_("Linux DVB frontend"),
-  .ic_save       = linuxdvb_frontend_class_save,
+  .ic_doc        = tvh_doc_linuxdvb_frontend_class,
+  .ic_changed    = linuxdvb_frontend_class_changed,
   .ic_properties = (const property_t[]) {
     {
       .type     = PT_STR,
       .id       = "fe_path",
       .name     = N_("Frontend path"),
+      .desc     = N_("Path to the frontend used by the device."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .off      = offsetof(linuxdvb_frontend_t, lfe_fe_path),
     },
@@ -69,6 +76,7 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_STR,
       .id       = "dvr_path",
       .name     = N_("Input path"),
+      .desc     = N_("The input path used by the device."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .off      = offsetof(linuxdvb_frontend_t, lfe_dvr_path),
     },
@@ -76,6 +84,7 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_STR,
       .id       = "dmx_path",
       .name     = N_("Demux path"),
+      .desc     = N_("The demux path used by the device."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .off      = offsetof(linuxdvb_frontend_t, lfe_dmx_path),
     },
@@ -83,6 +92,7 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_INT,
       .id       = "fe_number",
       .name     = N_("Frontend number"),
+      .desc     = N_("The frontend number given to the device."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .off      = offsetof(linuxdvb_frontend_t, lfe_number),
     },
@@ -90,6 +100,7 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_INT,
       .id       = "pids_max",
       .name     = N_("Maximum PIDs"),
+      .desc     = N_("The frontend number given to the device."),
       .off      = offsetof(linuxdvb_frontend_t, lfe_pids_max),
       .opts     = PO_ADVANCED,
       .def.i    = 32
@@ -98,12 +109,20 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_BOOL,
       .id       = "powersave",
       .name     = N_("Power save"),
+      .desc     = N_("Enable/disable power save mode (if supported by "
+                     "the device)."),
       .off      = offsetof(linuxdvb_frontend_t, lfe_powersave),
     },
     {
       .type     = PT_U32,
       .id       = "tune_repeats",
       .name     = N_("# tune repeats"),
+      .desc     = N_("Number of repeats for the tune requests (default is "
+                     "zero - no repeats). Note: this represents the "
+                     "number of repeats, not the number of requests - "
+                     "so 0 means 'send once: don't repeat', 1 means "
+                     "'send twice: send once, then send one repeat',"
+                     " etc."),
       .opts     = PO_ADVANCED,
       .off      = offsetof(linuxdvb_frontend_t, lfe_tune_repeats),
     },
@@ -111,6 +130,10 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_U32,
       .id       = "skip_bytes",
       .name     = N_("Skip initial bytes"),
+      .desc     = N_("If set, the first bytes from the MPEG-TS stream "
+                     "are discarded. It may be required for some "
+                     "drivers or hardware which do not flush the MPEG-TS "
+                      "buffers completely after a frequency/parameter change."),
       .opts     = PO_ADVANCED,
       .off      = offsetof(linuxdvb_frontend_t, lfe_skip_bytes),
     },
@@ -118,6 +141,9 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_U32,
       .id       = "ibuf_size",
       .name     = N_("Input buffer (bytes)"),
+      .desc     = N_("The number of bytes to buffer. By default, "
+                     "linuxdvb's input buffer is 18800 bytes long. The "
+                     "accepted range is 18800-1880000 bytes."),
       .opts     = PO_ADVANCED,
       .off      = offsetof(linuxdvb_frontend_t, lfe_ibuf_size),
     },
@@ -125,6 +151,14 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_U32,
       .id       = "status_period",
       .name     = N_("Status period (ms)"),
+      .desc     = N_("By default, linuxdvb's status read period is "
+                     "1000ms (one second). The accepted range is 250ms "
+                     "to 8000ms. Note that for some hardware or drivers "
+                     "(like USB), the status operations take too much "
+                     "time and CPU. In this case, increase the default "
+                     "value. For fast hardware, this value might be "
+                     "decreased to make the decision of the re-tune "
+                     "algorithm based on the signal status faster."),
       .opts     = PO_ADVANCED,
       .off      = offsetof(linuxdvb_frontend_t, lfe_status_period),
     },
@@ -132,6 +166,10 @@ const idclass_t linuxdvb_frontend_class =
       .type     = PT_BOOL,
       .id       = "old_status",
       .name     = N_("Force old status"),
+      .desc     = N_("Always use the old ioctls to read the linuxdvb "
+                     "status (signal strength, SNR, error counters). "
+                     "Some drivers are not mature enough to provide the "
+                     "correct values using the new v5 linuxdvb API."),
       .opts     = PO_ADVANCED,
       .off      = offsetof(linuxdvb_frontend_t, lfe_old_status),
     },
@@ -143,12 +181,14 @@ const idclass_t linuxdvb_frontend_dvbt_class =
 {
   .ic_super      = &linuxdvb_frontend_class,
   .ic_class      = "linuxdvb_frontend_dvbt",
-  .ic_caption    = N_("Linux DVB-T frontend"),
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbt_class,
+  .ic_caption    = N_("TV Adapters - Linux DVB-T Frontend"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_BOOL,
       .id       = "lna",
       .name     = N_("LNA (low noise amplifier)"),
+      .desc     = N_("Enable/disable LNA."),
       .off      = offsetof(linuxdvb_frontend_t, lfe_lna),
     },
     {}
@@ -168,12 +208,17 @@ static int
 linuxdvb_frontend_dvbs_class_satconf_set ( void *self, const void *str )
 {
   linuxdvb_frontend_t *lfe = self;
+  htsmsg_t *conf;
+  str = str ?: "";
   if (lfe->lfe_satconf) {
-    if (!strcmp(str ?: "", lfe->lfe_satconf->ls_type))
+    if (!strcmp(str, lfe->lfe_satconf->ls_type))
       return 0;
     linuxdvb_satconf_delete(lfe->lfe_satconf, 1);
   }
-  lfe->lfe_satconf = linuxdvb_satconf_create(lfe, str, NULL, NULL);
+  conf = htsmsg_create_map();
+  htsmsg_add_str(conf, "type", str);
+  lfe->lfe_satconf = linuxdvb_satconf_create(lfe, conf);
+  htsmsg_destroy(conf);
   return 1;
 }
 
@@ -195,7 +240,9 @@ linuxdvb_frontend_dvbs_class_master_enum( void * self, const char *lang )
   linuxdvb_frontend_t *lfe = self, *lfe2;
   linuxdvb_adapter_t *la;
   tvh_hardware_t *th;
+  char ubuf[UUID_HEX_SIZE];
   htsmsg_t *m = htsmsg_create_list();
+  if (self == NULL) return m;
   htsmsg_t *e = htsmsg_create_map();
   htsmsg_add_str(e, "key", "");
   htsmsg_add_str(e, "val", N_("This tuner"));
@@ -206,7 +253,7 @@ linuxdvb_frontend_dvbs_class_master_enum( void * self, const char *lang )
     LIST_FOREACH(lfe2, &la->la_frontends, lfe_link) {
       if (lfe2 != lfe && lfe2->lfe_type == lfe->lfe_type) {
         e = htsmsg_create_map();
-        htsmsg_add_str(e, "key", idnode_uuid_as_sstr(&lfe2->ti_id));
+        htsmsg_add_str(e, "key", idnode_uuid_as_str(&lfe2->ti_id, ubuf));
         htsmsg_add_str(e, "val", lfe2->mi_name);
         htsmsg_add_msg(m, NULL, e);
       }
@@ -219,13 +266,15 @@ const idclass_t linuxdvb_frontend_dvbs_class =
 {
   .ic_super      = &linuxdvb_frontend_class,
   .ic_class      = "linuxdvb_frontend_dvbs",
-  .ic_caption    = N_("Linux DVB-S frontend"),
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbs_class,
+  .ic_caption    = N_("TV Adapters - Linux DVB-S Frontend (Master)"),
   .ic_get_childs = linuxdvb_frontend_dvbs_class_get_childs,
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
       .id       = "satconf",
-      .name     = N_("SatConfig"),
+      .name     = N_("Satellite config"),
+      .desc     = N_("The satellite configuration to use."),
       .opts     = PO_NOSAVE,
       .set      = linuxdvb_frontend_dvbs_class_satconf_set,
       .get      = linuxdvb_frontend_dvbs_class_satconf_get,
@@ -236,6 +285,15 @@ const idclass_t linuxdvb_frontend_dvbs_class =
       .type     = PT_STR,
       .id       = "fe_master",
       .name     = N_("Master tuner"),
+      .desc     = N_("The signal from the standard universal LNB can be "
+                     "split using a simple coaxial splitter "
+                     "(no multiswitch) to several outputs. In this "
+                     "case, the position, the polarization and low-high "
+                     "band settings must be equal. If you set another "
+                     "tuner as master, then this tuner will act as "
+                     "a slave and Tvheadend will assure that this tuner "
+                     "will not use incompatible parameters (position, "
+                     "polarization, lo-hi)."),
       .list     = linuxdvb_frontend_dvbs_class_master_enum,
       .off      = offsetof(linuxdvb_frontend_t, lfe_master),
     },
@@ -250,13 +308,23 @@ const idclass_t linuxdvb_frontend_dvbs_class =
 const idclass_t linuxdvb_frontend_dvbs_slave_class =
 {
   .ic_super      = &linuxdvb_frontend_class,
-  .ic_class      = "linuxdvb_frontend_dvbs",
-  .ic_caption    = N_("Linux DVB-S slave frontend"),
+  .ic_class      = "linuxdvb_frontend_dvbs_slave",
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbs_class,
+  .ic_caption    = N_("TV Adapters - Linux DVB-S Slave Frontend"),
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
       .id       = "fe_master",
       .name     = N_("Master tuner"),
+      .desc     = N_("The signal from the standard universal LNB can be "
+                     "split using a simple coaxial splitter "
+                     "(no multiswitch) to several outputs. In this "
+                     "case, the position, the polarization and low-high "
+                     "band settings must be equal. If you set another "
+                     "tuner as master, then this tuner will act as "
+                     "a slave and tvheadend will assure that this tuner "
+                     "will not use incompatible parameters (position, "
+                     "polarization, lo-hi)."),
       .list     = linuxdvb_frontend_dvbs_class_master_enum,
       .off      = offsetof(linuxdvb_frontend_t, lfe_master),
     },
@@ -272,17 +340,73 @@ const idclass_t linuxdvb_frontend_dvbc_class =
 {
   .ic_super      = &linuxdvb_frontend_class,
   .ic_class      = "linuxdvb_frontend_dvbc",
-  .ic_caption    = N_("Linux DVB-C frontend"),
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbc_class,
+  .ic_caption    = N_("TV Adapters - Linux DVB-C Frontend"),
   .ic_properties = (const property_t[]){
     {}
   }
 };
 
-const idclass_t linuxdvb_frontend_atsc_class =
+const idclass_t linuxdvb_frontend_atsc_t_class =
 {
   .ic_super      = &linuxdvb_frontend_class,
-  .ic_class      = "linuxdvb_frontend_atsc",
-  .ic_caption    = N_("Linux ATSC frontend"),
+  .ic_class      = "linuxdvb_frontend_atsc_t",
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbt_class,
+  .ic_caption    = N_("TV Adapters - Linux ATSC-T Frontend"),
+  .ic_properties = (const property_t[]){
+    {}
+  }
+};
+
+const idclass_t linuxdvb_frontend_atsc_c_class =
+{
+  .ic_super      = &linuxdvb_frontend_class,
+  .ic_class      = "linuxdvb_frontend_atsc_c",
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbc_class,
+  .ic_caption    = N_("TV Adapters - Linux ATSC-C Frontend"),
+  .ic_properties = (const property_t[]){
+    {}
+  }
+};
+
+const idclass_t linuxdvb_frontend_isdb_t_class =
+{
+  .ic_super      = &linuxdvb_frontend_class,
+  .ic_class      = "linuxdvb_frontend_isdb_t",
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbt_class,
+  .ic_caption    = N_("TV Adapters - Linux ISDB-T Frontend"),
+  .ic_properties = (const property_t[]){
+    {}
+  }
+};
+
+const idclass_t linuxdvb_frontend_isdb_c_class =
+{
+  .ic_super      = &linuxdvb_frontend_class,
+  .ic_class      = "linuxdvb_frontend_isdb_c",
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbc_class,
+  .ic_caption    = N_("TV Adapters - Linux ISDB-C Frontend"),
+  .ic_properties = (const property_t[]){
+    {}
+  }
+};
+
+const idclass_t linuxdvb_frontend_isdb_s_class =
+{
+  .ic_super      = &linuxdvb_frontend_class,
+  .ic_class      = "linuxdvb_frontend_isdb_s",
+  .ic_doc        = tvh_doc_linuxdvb_frontend_dvbs_class,
+  .ic_caption    = N_("TV Adapters - Linux ISDB-S Frontend (Master)"),
+  .ic_properties = (const property_t[]){
+    {}
+  }
+};
+
+const idclass_t linuxdvb_frontend_dab_class =
+{
+  .ic_super      = &linuxdvb_frontend_class,
+  .ic_class      = "linuxdvb_frontend_dab",
+  .ic_caption    = N_("TV Adapters - Linux DAB Frontend"),
   .ic_properties = (const property_t[]){
     {}
   }
@@ -309,7 +433,7 @@ linuxdvb_frontend_enabled_updated ( mpegts_input_t *mi )
       if (lfe->lfe_satconf)
         linuxdvb_satconf_reset(lfe->lfe_satconf);
     }
-    gtimer_disarm(&lfe->lfe_monitor_timer);
+    mtimer_disarm(&lfe->lfe_monitor_timer);
 
   /* Ensure FE opened (if not powersave) */
   } else if (!lfe->lfe_powersave && lfe->lfe_fe_fd <= 0 && lfe->lfe_fe_path) {
@@ -320,18 +444,18 @@ linuxdvb_frontend_enabled_updated ( mpegts_input_t *mi )
 }
 
 static int
-linuxdvb_frontend_get_weight ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags )
+linuxdvb_frontend_get_weight ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags, int weight )
 {
-  int weight = 0;
+  int w = 0;
   linuxdvb_adapter_t *la = ((linuxdvb_frontend_t*)mi)->lfe_adapter;
   linuxdvb_frontend_t *lfe;
   if (la->la_exclusive) {
     LIST_FOREACH(lfe, &la->la_frontends, lfe_link)
-      weight = MAX(weight, mpegts_input_get_weight((mpegts_input_t*)lfe, mm, flags));
+      w = MAX(w, mpegts_input_get_weight((mpegts_input_t*)lfe, mm, flags, weight));
   } else {
-    weight = mpegts_input_get_weight(mi, mm, flags);
+    w = mpegts_input_get_weight(mi, mm, flags, weight);
   }
-  return weight;
+  return w;
 }
 
 static int
@@ -355,14 +479,16 @@ linuxdvb_frontend_get_grace ( mpegts_input_t *mi, mpegts_mux_t *mm )
 }
 
 static int
-linuxdvb_frontend_is_enabled ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags )
+linuxdvb_frontend_is_enabled
+  ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags, int weight )
 {
   linuxdvb_frontend_t *lfe = (linuxdvb_frontend_t*)mi, *lfe2;
   linuxdvb_adapter_t *la;
   tvh_hardware_t *th;
+  char ubuf[UUID_HEX_SIZE];
 
   if (lfe->lfe_fe_path == NULL) return 0;
-  if (!mpegts_input_is_enabled(mi, mm, flags)) return 0;
+  if (!mpegts_input_is_enabled(mi, mm, flags, weight)) return 0;
   if (access(lfe->lfe_fe_path, R_OK | W_OK)) return 0;
   if (lfe->lfe_in_setup) return 0;
   if (lfe->lfe_type != DVB_TYPE_S) return 1;
@@ -374,13 +500,15 @@ linuxdvb_frontend_is_enabled ( mpegts_input_t *mi, mpegts_mux_t *mm, int flags )
     LIST_FOREACH(lfe2, &la->la_frontends, lfe_link) {
       if (lfe2 == lfe) continue;
       if (lfe2->lfe_type != DVB_TYPE_S) continue;
-      if (lfe->lfe_master && !strcmp(lfe->lfe_master, idnode_uuid_as_sstr(&lfe2->ti_id))) {
+      if (lfe->lfe_master && !strcmp(lfe->lfe_master, idnode_uuid_as_str(&lfe2->ti_id, ubuf))) {
         if (lfe2->lfe_satconf == NULL)
           return 0; /* invalid master */
+        if (lfe2->lfe_refcount <= 0)
+          return 0; /* prefer master */
         return linuxdvb_satconf_match_mux(lfe2->lfe_satconf, mm);
       }
       if (lfe2->lfe_master &&
-          !strcmp(lfe2->lfe_master, idnode_uuid_as_sstr(&lfe->ti_id)) &&
+          !strcmp(lfe2->lfe_master, idnode_uuid_as_str(&lfe->ti_id, ubuf)) &&
           lfe2->lfe_refcount > 0) {
         if (lfe->lfe_satconf == NULL)
           return 0;
@@ -421,7 +549,7 @@ linuxdvb_frontend_stop_mux
   lfe->lfe_status2 = 0;
 
   /* Ensure it won't happen immediately */
-  gtimer_arm(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, 2);
+  mtimer_arm_rel(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, sec2mono(2));
 
   if (lfe->lfe_satconf && lfe->lfe_refcount == 1)
     linuxdvb_satconf_post_stop_mux(lfe->lfe_satconf);
@@ -438,7 +566,7 @@ linuxdvb_frontend_stop_mux
         lfe2->lfe_status  = 0;
         lfe2->lfe_status2 = 0;
         /* Ensure it won't happen immediately */
-        gtimer_arm(&lfe2->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, 2);
+        mtimer_arm_rel(&lfe2->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, sec2mono(2));
         if (lfe2->lfe_satconf)
           linuxdvb_satconf_post_stop_mux(lfe2->lfe_satconf);
         lfe2->lfe_in_setup = 0;
@@ -469,7 +597,7 @@ linuxdvb_frontend_start_mux
   if (lfe->lfe_master) {
     assert(lfe->lfe_type == DVB_TYPE_S);
     lfe2 = (linuxdvb_frontend_t *)idnode_find(lfe->lfe_master, &linuxdvb_frontend_class, NULL);
-    if (lfe2->lfe_type != lfe->lfe_type)
+    if (lfe2 && lfe2->lfe_type != lfe->lfe_type)
       lfe2 = NULL;
     res = SM_CODE_TUNING_FAILED;
     if (lfe2) {
@@ -566,7 +694,7 @@ linuxdvb_frontend_monitor ( void *aux )
   signal_status_t sigstat;
   streaming_message_t sm;
   service_t *s;
-  int logit = 0, retune;
+  int logit = 0, retune, e;
   uint32_t period = MINMAX(lfe->lfe_status_period, 250, 8000);
 #if DVB_VER_ATLEAST(5,10)
   struct dtv_property fe_properties[6];
@@ -603,7 +731,7 @@ linuxdvb_frontend_monitor ( void *aux )
   if (!mmi || !lfe->lfe_ready) return;
 
   /* re-arm */
-  gtimer_arm_ms(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, period);
+  mtimer_arm_rel(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, ms2mono(period));
 
   /* Get current status */
   if (ioctl(lfe->lfe_fe_fd, FE_READ_STATUS, &fe_status) == -1) {
@@ -628,7 +756,7 @@ linuxdvb_frontend_monitor ( void *aux )
              (fe_status & FE_HAS_CARRIER) ? " | CARRIER" : "",
              (fe_status & FE_HAS_VITERBI) ? " | VITERBI" : "",
              (fe_status & FE_HAS_SYNC) ?    " | SYNC"    : "",
-             (fe_status & FE_HAS_LOCK) ?    " | SIGNAL"  : "",
+             (fe_status & FE_HAS_LOCK) ?    " | LOCK"  : "",
              (fe_status & FE_TIMEDOUT) ?    "TIMEOUT" : "");
   } else {
     tvhtrace("linuxdvb", "%s - status %d (%04X)", buf, status, fe_status);
@@ -643,7 +771,7 @@ linuxdvb_frontend_monitor ( void *aux )
     if (lfe->lfe_locked && lfe->lfe_freq > 0) {
       tvhlog(LOG_WARNING, "linuxdvb", "%s - %s", buf, retune ? "retune" : "retune nodata");
       linuxdvb_frontend_tune0(lfe, mmi, lfe->lfe_freq);
-      gtimer_arm_ms(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, 50);
+      mtimer_arm_rel(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, ms2mono(50));
       lfe->lfe_locked = 1;
     }
   }
@@ -664,7 +792,11 @@ linuxdvb_frontend_monitor ( void *aux )
       pthread_mutex_lock(&lfe->lfe_dvr_lock);
       tvhthread_create(&lfe->lfe_dvr_thread, NULL,
                        linuxdvb_frontend_input_thread, lfe, "lnxdvb-front");
-      pthread_cond_wait(&lfe->lfe_dvr_cond, &lfe->lfe_dvr_lock);
+      do {
+        e = tvh_cond_wait(&lfe->lfe_dvr_cond, &lfe->lfe_dvr_lock);
+        if (e == ETIMEDOUT)
+          break;
+      } while (ERRNO_AGAIN(e));
       pthread_mutex_unlock(&lfe->lfe_dvr_lock);
 
       /* Table handlers */
@@ -673,19 +805,22 @@ linuxdvb_frontend_monitor ( void *aux )
 
     /* Re-arm (quick) */
     } else {
-      gtimer_arm_ms(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor,
-                    lfe, 50);
+      mtimer_arm_rel(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor,
+                     lfe, ms2mono(50));
 
       /* Monitor 1 per sec */
-      if (dispatch_clock < lfe->lfe_monitor)
+      if (mclk() < lfe->lfe_monitor)
         return;
-      lfe->lfe_monitor = dispatch_clock + 1;
+      lfe->lfe_monitor = mclk() + sec2mono(1);
     }
   } else {
-    if (dispatch_clock < lfe->lfe_monitor)
+    if (mclk() < lfe->lfe_monitor)
       return;
-    lfe->lfe_monitor = dispatch_clock + (period + 999) / 1000;
+    lfe->lfe_monitor = mclk() + ms2mono(period);
   }
+
+
+  pthread_mutex_lock(&mmi->tii_stats_mutex);
 
   /* Statistics - New API */
 #if DVB_VER_ATLEAST(5,10)
@@ -825,7 +960,8 @@ linuxdvb_frontend_monitor ( void *aux )
     gotprop = 0;
     if(ioctl_check(lfe, 8) && fe_properties[4].u.st.len > 0) {
       if(fe_properties[4].u.st.stat[0].scale == FE_SCALE_COUNTER) {
-        mmi->tii_stats.unc = mmi->tii_stats.ec_block = fe_properties[4].u.st.stat[0].uvalue;
+        atomic_set(&mmi->tii_stats.unc, fe_properties[4].u.st.stat[0].uvalue);
+        mmi->tii_stats.ec_block = fe_properties[4].u.st.stat[0].uvalue;
         gotprop = 1;
       }
       else {
@@ -845,7 +981,9 @@ linuxdvb_frontend_monitor ( void *aux )
       }
       else {
         ioctl_bad(lfe, 9);
-        mmi->tii_stats.ec_block = mmi->tii_stats.unc = 0; /* both values or none */
+        /* both values to none */
+        mmi->tii_stats.ec_block = 0;
+        atomic_set(&mmi->tii_stats.unc, 0);
         if (logit)
           tvhlog(LOG_WARNING, "linuxdvb", "Unhandled TOTAL_BLOCK_COUNT scale: %d",
                  fe_properties[5].u.st.stat[0].scale);
@@ -854,7 +992,7 @@ linuxdvb_frontend_monitor ( void *aux )
     if(!gotprop && ioctl_check(lfe, 10)) {
       /* try old API */
       if (!ioctl(lfe->lfe_fe_fd, FE_READ_UNCORRECTED_BLOCKS, &u32)) {
-        mmi->tii_stats.unc = u32;
+        atomic_set(&mmi->tii_stats.unc, u32);
         gotprop = 1;
       }
       else {
@@ -896,7 +1034,7 @@ linuxdvb_frontend_monitor ( void *aux )
         tvhlog(LOG_WARNING, "linuxdvb", "Unable to provide SNR value.");
     }
     if (ioctl_check(lfe, 4) && !ioctl(lfe->lfe_fe_fd, FE_READ_UNCORRECTED_BLOCKS, &u32))
-      mmi->tii_stats.unc = u32;
+      atomic_set(&mmi->tii_stats.unc, u32);
     else {
       ioctl_bad(lfe, 4);
       if (logit)
@@ -909,7 +1047,7 @@ linuxdvb_frontend_monitor ( void *aux )
   sigstat.snr          = mmi->tii_stats.snr;
   sigstat.signal       = mmi->tii_stats.signal;
   sigstat.ber          = mmi->tii_stats.ber;
-  sigstat.unc          = mmi->tii_stats.unc;
+  sigstat.unc          = atomic_get(&mmi->tii_stats.unc);
   sigstat.signal_scale = mmi->tii_stats.signal_scale;
   sigstat.snr_scale    = mmi->tii_stats.snr_scale;
   sigstat.ec_bit       = mmi->tii_stats.ec_bit;
@@ -918,6 +1056,9 @@ linuxdvb_frontend_monitor ( void *aux )
   sigstat.tc_block     = mmi->tii_stats.tc_block;
   sm.sm_type = SMT_SIGNAL_STATUS;
   sm.sm_data = &sigstat;
+
+  pthread_mutex_unlock(&mmi->tii_stats_mutex);
+
   LIST_FOREACH(s, &mmi->mmi_mux->mm_transports, s_active_link) {
     pthread_mutex_lock(&s->s_stream_mutex);
     streaming_pad_deliver(&s->s_streaming_pad, streaming_msg_clone(&sm));
@@ -983,7 +1124,7 @@ linuxdvb_frontend_close_pid0
           pids_size--, pids++);
   if (pids_size == 0)
     return;
-  tvhtrace("linuxdvb", "%s - close PID %04X (%d) fd %d\n", name, pid, pid, pids->fd);
+  tvhtrace("linuxdvb", "%s - close PID %04X (%d) fd %d", name, pid, pid, pids->fd);
   close(pids->fd);
   pids->fd = -1;
   pids->pid = -1;
@@ -1059,7 +1200,7 @@ linuxdvb_frontend_input_thread ( void *aux )
   pthread_mutex_lock(&lfe->lfe_dvr_lock);
   lfe->mi_display_name((mpegts_input_t*)lfe, name, sizeof(name));
   mmi = LIST_FIRST(&lfe->mi_mux_active);
-  pthread_cond_signal(&lfe->lfe_dvr_cond);
+  tvh_cond_signal(&lfe->lfe_dvr_cond, 0);
   pthread_mutex_unlock(&lfe->lfe_dvr_lock);
   if (mmi == NULL) return NULL;
 
@@ -1086,7 +1227,7 @@ linuxdvb_frontend_input_thread ( void *aux )
   linuxdvb_update_pids(lfe, name, &tuned, pids, ARRAY_SIZE(pids));
 
   /* Read */
-  while (tvheadend_running) {
+  while (tvheadend_is_running()) {
     nfds = tvhpoll_wait(efd, ev, 1, 150);
     if (nfds == 0) { /* timeout */
       if (nodata == 0) {
@@ -1451,6 +1592,8 @@ linuxdvb_frontend_tune0
 #undef _OFDM
     break;
   case DVB_TYPE_C:
+  case DVB_TYPE_ATSC_C:
+  case DVB_TYPE_ISDB_C:
     p.u.qam.symbol_rate      = dmc->u.dmc_fe_qam.symbol_rate;
     p.u.qam.fec_inner        = TRU(qam.fec_inner, fec_tbl, FEC_AUTO);
     p.u.qam.modulation       = TR(modulation, mod_tbl, QAM_AUTO);
@@ -1459,9 +1602,14 @@ linuxdvb_frontend_tune0
     p.u.qpsk.symbol_rate     = dmc->u.dmc_fe_qpsk.symbol_rate;
     p.u.qpsk.fec_inner       = TRU(qpsk.fec_inner, fec_tbl, FEC_AUTO);
     break;
-  case DVB_TYPE_ATSC:
+  case DVB_TYPE_ATSC_T:
     p.u.vsb.modulation       = TR(modulation, mod_tbl, QAM_AUTO);
     break;
+#if DVB_API_VERSION >= 5
+  case DVB_TYPE_ISDB_T:
+  case DVB_TYPE_DAB:
+    break;
+#endif
   default:
     tvherror("linuxdvb", "%s - unknown FE type %d", buf1, dmc->dmc_fe_type);
     return SM_CODE_TUNING_FAILED;
@@ -1477,7 +1625,7 @@ linuxdvb_frontend_tune0
 
   /* S2 tuning */
 #if DVB_API_VERSION >= 5
-  struct dtv_property cmds[20];
+  struct dtv_property cmds[32];
   struct dtv_properties cmdseq;
   
 
@@ -1525,7 +1673,9 @@ linuxdvb_frontend_tune0
 #endif
 
   /* DVB-C */
-  } else if (lfe->lfe_type == DVB_TYPE_C) {
+  } else if (lfe->lfe_type == DVB_TYPE_C ||
+             lfe->lfe_type == DVB_TYPE_ATSC_C ||
+             lfe->lfe_type == DVB_TYPE_ISDB_C) {
     S2CMD(DTV_SYMBOL_RATE,       p.u.qam.symbol_rate);
     S2CMD(DTV_MODULATION,        p.u.qam.modulation);
     S2CMD(DTV_INNER_FEC,         p.u.qam.fec_inner);
@@ -1550,9 +1700,46 @@ linuxdvb_frontend_tune0
 #endif
     }
 
-  /* ATSC */
-  } else {
+  /* ATSC-T */
+  } else if (lfe->lfe_type == DVB_TYPE_ATSC_T) {
     S2CMD(DTV_MODULATION,        p.u.vsb.modulation);
+
+#if DVB_VER_ATLEAST(5,0)
+  /* ISDB-T */
+  } else if (lfe->lfe_type == DVB_TYPE_ISDB_T) {
+    int i, j;
+    S2CMD(DTV_BANDWIDTH_HZ,      dvb_bandwidth(dmc->u.dmc_fe_isdbt.bandwidth));
+#if DVB_VER_ATLEAST(5,1)
+    S2CMD(DTV_GUARD_INTERVAL, TRU(isdbt.guard_interval, guard_tbl, GUARD_INTERVAL_AUTO));
+    S2CMD(DTV_TRANSMISSION_MODE, TRANSMISSION_MODE_AUTO);
+    S2CMD(DTV_ISDBT_LAYER_ENABLED,     7);
+    S2CMD(DTV_ISDBT_PARTIAL_RECEPTION, 1);
+    S2CMD(DTV_ISDBT_SOUND_BROADCASTING,0);
+    S2CMD(DTV_ISDBT_SB_SUBCHANNEL_ID,  0);
+    S2CMD(DTV_ISDBT_SB_SEGMENT_IDX,    0);
+    S2CMD(DTV_ISDBT_SB_SEGMENT_COUNT,  0);
+    for (i = j = 0; i < 3; i++, j += DTV_ISDBT_LAYERB_FEC - DTV_ISDBT_LAYERA_FEC) {
+      S2CMD(DTV_ISDBT_LAYERA_FEC               + j, TRU(isdbt.layers[i].fec, fec_tbl, FEC_AUTO));
+      S2CMD(DTV_ISDBT_LAYERA_MODULATION        + j, TRU(isdbt.layers[i].modulation, mod_tbl, QAM_AUTO));
+      S2CMD(DTV_ISDBT_LAYERA_SEGMENT_COUNT     + j, dmc->u.dmc_fe_isdbt.layers[i].segment_count);
+      S2CMD(DTV_ISDBT_LAYERA_TIME_INTERLEAVING + j, dmc->u.dmc_fe_isdbt.layers[i].time_interleaving);
+    }
+#endif
+
+  /* ISDB-S */
+  } else if (lfe->lfe_type == DVB_TYPE_ISDB_S) {
+    r = dmc->dmc_fe_stream_id != DVB_NO_STREAM_ID_FILTER ? (dmc->dmc_fe_stream_id & 0xFF) |
+        ((dmc->dmc_fe_pls_code & 0x3FFFF)<<8) | ((dmc->dmc_fe_pls_mode & 0x3)<<26) :
+        DVB_NO_STREAM_ID_FILTER;
+#if DVB_VER_ATLEAST(5,9)
+    S2CMD(DTV_STREAM_ID,       r);
+#elif DVB_VER_ATLEAST(5,3)
+    S2CMD(DTV_DVBT2_PLP_ID,    r);
+#endif
+
+  /* DAB */
+  } else if (lfe->lfe_type == DVB_TYPE_DAB) {
+#endif /* 5.0+ */
   }
 
   /* Tune */
@@ -1607,7 +1794,7 @@ linuxdvb_frontend_tune1
   rep = lfe->lfe_tune_repeats > 0 ? lfe->lfe_tune_repeats : 0;
   for (i = 0; i <= rep; i++) {
     if (i > 0)
-      usleep(15000);
+      tvh_safe_usleep(15000);
     r = linuxdvb_frontend_tune0(lfe, mmi, freq);
     if (r)
       break;
@@ -1617,7 +1804,7 @@ linuxdvb_frontend_tune1
   if (!r) {
     time(&lfe->lfe_monitor);
     lfe->lfe_monitor += 4;
-    gtimer_arm_ms(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, 50);
+    mtimer_arm_rel(&lfe->lfe_monitor_timer, linuxdvb_frontend_monitor, lfe, ms2mono(50));
     lfe->lfe_ready = 1;
   }
 
@@ -1631,6 +1818,72 @@ linuxdvb_frontend_tune1
  * Creation/Config
  * *************************************************************************/
 
+static mpegts_network_t *
+linuxdvb_frontend_wizard_network ( linuxdvb_frontend_t *lfe )
+{
+  linuxdvb_satconf_ele_t *ele = NULL;
+
+  if (lfe->lfe_satconf) {
+    ele = TAILQ_FIRST(&lfe->lfe_satconf->ls_elements);
+    if (ele && ele->lse_networks && ele->lse_networks->is_count > 0)
+      return (mpegts_network_t *)ele->lse_networks->is_array[0];
+  }
+  return (mpegts_network_t *)LIST_FIRST(&lfe->mi_networks);
+}
+
+static htsmsg_t *
+linuxdvb_frontend_wizard_get( tvh_input_t *ti, const char *lang )
+{
+  linuxdvb_frontend_t *lfe = (linuxdvb_frontend_t*)ti;
+  mpegts_network_t *mn;
+  const idclass_t *idc = NULL;
+
+  mn = linuxdvb_frontend_wizard_network(lfe);
+  if ((lfe->lfe_master == 0 && mn == NULL) || (mn && mn->mn_wizard))
+    idc = dvb_network_class_by_fe_type(lfe->lfe_type);
+  return mpegts_network_wizard_get((mpegts_input_t *)lfe, idc, mn, lang);
+}
+
+static void
+linuxdvb_frontend_wizard_set( tvh_input_t *ti, htsmsg_t *conf, const char *lang )
+{
+  linuxdvb_frontend_t *lfe = (linuxdvb_frontend_t*)ti;
+  const char *ntype = htsmsg_get_str(conf, "mpegts_network_type");
+  mpegts_network_t *mn;
+  htsmsg_t *nlist;
+
+  if (LIST_FIRST(&lfe->mi_mux_active))
+    return;
+  mpegts_network_wizard_create(ntype, &nlist, lang);
+  mn = linuxdvb_frontend_wizard_network(lfe);
+  if (ntype && (mn == NULL || mn->mn_wizard)) {
+    if (lfe->lfe_satconf) {
+      htsmsg_t *conf = htsmsg_create_map();
+      htsmsg_t *elems = htsmsg_create_list();
+      htsmsg_t *elem = htsmsg_create_map();
+      htsmsg_add_str(conf, "type", "4port");
+      htsmsg_add_bool(elem, "enable", 1);
+      htsmsg_add_msg(elem, "networks", nlist);
+      htsmsg_add_msg(elems, NULL, elem);
+      htsmsg_add_msg(conf, "elements", elems);
+      if (lfe->lfe_satconf) {
+        linuxdvb_satconf_delete(lfe->lfe_satconf, 0);
+        lfe->lfe_satconf = NULL;
+      }
+      lfe->lfe_satconf = linuxdvb_satconf_create(lfe, conf);
+      htsmsg_destroy(conf);
+    } else {
+      mpegts_input_set_networks((mpegts_input_t *)lfe, nlist);
+      htsmsg_destroy(nlist);
+    }
+    if (linuxdvb_frontend_wizard_network(lfe))
+      mpegts_input_set_enabled((mpegts_input_t *)lfe, 1);
+    linuxdvb_adapter_changed(lfe->lfe_adapter);
+  } else {
+    htsmsg_destroy(nlist);
+  }
+}
+
 linuxdvb_frontend_t *
 linuxdvb_frontend_create
   ( htsmsg_t *conf, linuxdvb_adapter_t *la, int number,
@@ -1638,10 +1891,10 @@ linuxdvb_frontend_create
     dvb_fe_type_t type, const char *name )
 {
   const idclass_t *idc;
-  const char *str, *uuid = NULL, *muuid = NULL, *scuuid = NULL, *sctype = NULL;
+  const char *str, *uuid = NULL, *muuid = NULL;
   char id[16], lname[256];
   linuxdvb_frontend_t *lfe;
-  htsmsg_t *scconf = NULL;
+  htsmsg_t *scconf;
 
   /* Tuner slave */
   snprintf(id, sizeof(id), "master for #%d", number);
@@ -1676,8 +1929,18 @@ linuxdvb_frontend_create
     idc = &linuxdvb_frontend_dvbc_class;
   else if (type == DVB_TYPE_T)
     idc = &linuxdvb_frontend_dvbt_class;
-  else if (type == DVB_TYPE_ATSC)
-    idc = &linuxdvb_frontend_atsc_class;
+  else if (type == DVB_TYPE_ATSC_T)
+    idc = &linuxdvb_frontend_atsc_t_class;
+  else if (type == DVB_TYPE_ATSC_C)
+    idc = &linuxdvb_frontend_atsc_c_class;
+  else if (type == DVB_TYPE_ISDB_T)
+    idc = &linuxdvb_frontend_isdb_t_class;
+  else if (type == DVB_TYPE_ISDB_C)
+    idc = &linuxdvb_frontend_isdb_c_class;
+  else if (type == DVB_TYPE_ISDB_S)
+    idc = &linuxdvb_frontend_isdb_s_class;
+  else if (type == DVB_TYPE_DAB)
+    idc = &linuxdvb_frontend_dab_class;
   else {
     tvherror("linuxdvb", "unknown FE type %d", type);
     return NULL;
@@ -1716,6 +1979,8 @@ linuxdvb_frontend_create
   lfe->lfe_dvr_path = strdup(dvr_path);
 
   /* Input callbacks */
+  lfe->ti_wizard_get      = linuxdvb_frontend_wizard_get;
+  lfe->ti_wizard_set      = linuxdvb_frontend_wizard_set;
   lfe->mi_is_enabled      = linuxdvb_frontend_is_enabled;
   lfe->mi_start_mux       = linuxdvb_frontend_start_mux;
   lfe->mi_stop_mux        = linuxdvb_frontend_stop_mux;
@@ -1730,20 +1995,14 @@ linuxdvb_frontend_create
 
   /* DVR lock/cond */
   pthread_mutex_init(&lfe->lfe_dvr_lock, NULL);
-  pthread_cond_init(&lfe->lfe_dvr_cond, NULL);
+  tvh_cond_init(&lfe->lfe_dvr_cond);
   mpegts_pid_init(&lfe->lfe_pids);
  
-  /* Satconf */
-  if (conf && !muuid) {
-    if ((scconf = htsmsg_get_map(conf, "satconf"))) {
-      sctype = htsmsg_get_str(scconf, "type");
-      scuuid = htsmsg_get_str(scconf, "uuid");
-    }
-  }
-
   /* Create satconf */
-  if (lfe->lfe_type == DVB_TYPE_S && !lfe->lfe_satconf && !muuid)
-    lfe->lfe_satconf = linuxdvb_satconf_create(lfe, sctype, scuuid, scconf);
+  if (lfe->lfe_type == DVB_TYPE_S && !lfe->lfe_satconf && !muuid) {
+    scconf = conf ? htsmsg_get_map(conf, "satconf") : NULL;
+    lfe->lfe_satconf = linuxdvb_satconf_create(lfe, scconf);
+  }
 
   /* Double check enabled */
   linuxdvb_frontend_enabled_updated((mpegts_input_t*)lfe);
@@ -1754,17 +2013,17 @@ linuxdvb_frontend_create
 void
 linuxdvb_frontend_save ( linuxdvb_frontend_t *lfe, htsmsg_t *fe )
 {
-  char id[16];
+  char id[16], ubuf[UUID_HEX_SIZE];
   htsmsg_t *m = htsmsg_create_map();
 
   /* Save frontend */
   mpegts_input_save((mpegts_input_t*)lfe, m);
   htsmsg_add_str(m, "type", dvb_type2str(lfe->lfe_type));
-  htsmsg_add_str(m, "uuid", idnode_uuid_as_sstr(&lfe->ti_id));
+  htsmsg_add_str(m, "uuid", idnode_uuid_as_str(&lfe->ti_id, ubuf));
   if (lfe->lfe_satconf && !lfe->lfe_master) {
     htsmsg_t *s = htsmsg_create_map();
     linuxdvb_satconf_save(lfe->lfe_satconf, s);
-    htsmsg_add_str(s, "uuid", idnode_uuid_as_sstr(&lfe->lfe_satconf->ls_id));
+    htsmsg_add_str(s, "uuid", idnode_uuid_as_str(&lfe->lfe_satconf->ls_id, ubuf));
     htsmsg_add_msg(m, "satconf", s);
   }
   htsmsg_delete_field(m, "fe_master");
@@ -1788,7 +2047,7 @@ linuxdvb_frontend_delete ( linuxdvb_frontend_t *lfe )
   mpegts_input_stop_all((mpegts_input_t*)lfe);
 
   /* Stop monitor */
-  gtimer_disarm(&lfe->lfe_monitor_timer);
+  mtimer_disarm(&lfe->lfe_monitor_timer);
 
   /* Close FDs */
   if (lfe->lfe_fe_fd > 0)

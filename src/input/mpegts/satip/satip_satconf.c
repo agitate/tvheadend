@@ -65,18 +65,162 @@ satip_satconf_get_grace
   return sfc ? sfc->sfc_grace : 0;
 }
 
-int
+static int
+satip_satconf_master_or_slave
+  ( satip_frontend_t *lfe1, satip_frontend_t *lfe2 )
+{
+  return lfe1->sf_number == lfe2->sf_master ||
+         lfe2->sf_number == lfe1->sf_master;
+}
+
+static int
+satip_satconf_in_network_group
+  ( satip_frontend_t *lfe, int network_group, idnode_t *mn )
+{
+  satip_satconf_t *sfc;
+
+  TAILQ_FOREACH(sfc, &lfe->sf_satconf, sfc_link) {
+    if (sfc->sfc_position != lfe->sf_position)
+      continue;
+    if (network_group > 0 &&
+        sfc->sfc_network_group > 0 &&
+        sfc->sfc_network_group == network_group)
+      break;
+    else if (idnode_set_exists(sfc->sfc_networks, mn))
+      break;
+  }
+  return sfc != NULL;
+}
+
+static int
+satip_satconf_hash ( mpegts_mux_t *mm, int position )
+{
+  dvb_mux_conf_t *mc = &((dvb_mux_t *)mm)->lm_tuning;
+  assert(position <= 0x7fff);
+  return 1 | (mc->dmc_fe_freq > 11700000 ? 2 : 0) |
+         ((int)mc->u.dmc_fe_qpsk.polarisation << 8) |
+         ((position & 0xffff) << 16);
+}
+
+static int
+satip_satconf_check_limits
+  ( satip_frontend_t *lfe, satip_satconf_t *sfc, mpegts_mux_t *mm,
+    int flags, int weight, int manage )
+{
+  satip_frontend_t *lfe2, *lowest_lfe;
+  mpegts_mux_t *mm2;
+  mpegts_input_t *mi2;
+  idnode_t *mn = &mm->mm_network->mn_id;
+  int count, size, lowest, w2, r, i, limit, *hashes;
+
+  size = 0;
+  TAILQ_FOREACH(lfe2, &lfe->sf_device->sd_frontends, sf_link)
+    size++;
+  hashes = alloca(size * sizeof(int));
+
+  limit = sfc->sfc_network_limit > 0 ? sfc->sfc_network_limit : 1;
+
+retry:
+  memset(hashes, 0, size * sizeof(int));
+  lowest = INT_MAX;
+  lowest_lfe = NULL;
+
+  /* add wanted mux to hashes */
+  hashes[0] = satip_satconf_hash(mm, sfc->sfc_position);
+  count = 1;
+
+  TAILQ_FOREACH(lfe2, &lfe->sf_device->sd_frontends, sf_link) {
+    if (lfe == lfe2 || !lfe2->sf_running || lfe2->sf_type != DVB_TYPE_S)
+      continue;
+    if (sfc->sfc_network_limit) {
+      if (!satip_satconf_in_network_group(lfe2, sfc->sfc_network_group, mn))
+        continue;
+    } else {
+      if (!satip_satconf_master_or_slave(lfe, lfe2))
+        continue;
+    }
+    if (!manage && weight <= 0)
+      continue;
+    mi2 = (mpegts_input_t *)lfe2;
+    mm2 = lfe2->sf_req->sf_mmi->mmi_mux;
+    w2  = -1;
+    if (weight > 0 || manage)
+      w2 = lfe2->mi_get_weight(mi2, mm2, flags, 0);
+    if (!manage && w2 < weight)
+      continue;
+    if (manage && w2 < lowest) {
+      lowest = w2;
+      lowest_lfe = lfe2;
+    }
+    r = satip_satconf_hash(mm2, lfe2->sf_position);
+    for (i = 0; i < size; i++) {
+      if (hashes[i] == r)
+        break;
+      if (!hashes[i]) {
+        hashes[i] = r;
+        count++;
+        break;
+      }
+    }
+  }
+  if (count <= limit)
+    return 1;
+  if (manage && lowest_lfe) {
+    /* free tuner with lowest weight */
+    mm2 = lowest_lfe->sf_req->sf_mmi->mmi_mux;
+    mm2->mm_stop(mm2, 1, SM_CODE_SUBSCRIPTION_OVERRIDDEN);
+    goto retry;
+  }
+  return 0;
+}
+
+satip_satconf_t *
 satip_satconf_get_position
-  ( satip_frontend_t *lfe, mpegts_mux_t *mm )
+  ( satip_frontend_t *lfe, mpegts_mux_t *mm, int *hash,
+    int check, int flags, int weight )
 {
   satip_satconf_t *sfc;
   sfc = satip_satconf_find_ele(lfe, mm);
-  return sfc && sfc->sfc_enabled ? sfc->sfc_position : 0;
+  if (sfc && sfc->sfc_enabled) {
+    if (hash)
+      *hash = sfc->sfc_network_group > 0 ? satip_satconf_hash(mm, sfc->sfc_position) : 0;
+    if (!check)
+      return sfc;
+    if (check > 1) {
+      satip_satconf_check_limits(lfe, sfc, mm, flags, weight, 1);
+      return sfc;
+    } else {
+      if (sfc->sfc_network_limit <= 0)
+        return sfc;
+      if (satip_satconf_check_limits(lfe, sfc, mm, flags, weight, 0))
+        return sfc;
+    }
+  } else {
+    if (hash)
+      *hash = 0;
+  }
+  return 0;
 }
 
 /* **************************************************************************
  * Class definition
  * *************************************************************************/
+
+static void
+satip_satconf_sanity_check( satip_frontend_t *lfe )
+{
+  satip_satconf_t *sfc;
+
+  TAILQ_FOREACH(sfc, &lfe->sf_satconf, sfc_link) {
+    if (sfc->sfc_network_limit) {
+      if (lfe->sf_master) {
+        tvherror("satip", "%s: unable to combine master/slave with network limiter, "
+                          "disabling master", lfe->mi_name);
+        lfe->sf_master = 0;
+      }
+    }
+  }
+}
 
 static const void *
 satip_satconf_class_network_get( void *o )
@@ -95,6 +239,7 @@ satip_satconf_class_network_set( void *o, const void *p )
   htsmsg_field_t *f;
   const char *str;
   int i, save;
+  char ubuf[UUID_HEX_SIZE];
 
   HTSMSG_FOREACH(f, msg) {
     if (!(str = htsmsg_field_get_str(f))) continue;
@@ -121,7 +266,7 @@ satip_satconf_class_network_set( void *o, const void *p )
     TAILQ_FOREACH(sfc2, &lfe->sf_satconf, sfc_link) {
       for (i = 0; i < sfc2->sfc_networks->is_count; i++)
         htsmsg_add_str(l, NULL,
-                       idnode_uuid_as_sstr(sfc2->sfc_networks->is_array[i]));
+                       idnode_uuid_as_str(sfc2->sfc_networks->is_array[i], ubuf));
     }
     mpegts_input_class_network_set(lfe, l);
     /* update the slave tuners, too */
@@ -168,30 +313,36 @@ satip_satconf_class_get_title ( idnode_t *o, const char *lang )
 }
 
 static void
-satip_satconf_class_save ( idnode_t *in )
+satip_satconf_class_changed ( idnode_t *in )
 {
   satip_satconf_t *sfc = (satip_satconf_t*)in;
-  satip_device_save(sfc->sfc_lfe->sf_device);
+  satip_device_changed(sfc->sfc_lfe->sf_device);
+  satip_satconf_sanity_check(sfc->sfc_lfe);
 }
+
+CLASS_DOC(satip_satconf)
 
 const idclass_t satip_satconf_class =
 {
   .ic_class      = "satip_satconf",
-  .ic_caption    = N_("Satconf"),
+  .ic_caption    = N_("SAT>IP Satellite Configuration"),
   .ic_event      = "satip_satconf",
+  .ic_doc        = tvh_doc_satip_satconf_class,
   .ic_get_title  = satip_satconf_class_get_title,
-  .ic_save       = satip_satconf_class_save,
+  .ic_changed    = satip_satconf_class_changed,
   .ic_properties = (const property_t[]) {
     {
       .type     = PT_BOOL,
       .id       = "enabled",
       .name     = N_("Enabled"),
+      .desc     = N_("Enable or disable this configuration."),
       .off      = offsetof(satip_satconf_t, sfc_enabled),
     },
     {
       .type     = PT_STR,
       .id       = "displayname",
       .name     = N_("Name"),
+      .desc     = N_("Set the display name."),
       .off      = offsetof(satip_satconf_t, sfc_name),
       .notify   = idnode_notify_title_changed,
     },
@@ -199,6 +350,7 @@ const idclass_t satip_satconf_class =
       .type     = PT_INT,
       .id       = "priority",
       .name     = N_("Priority"),
+      .desc     = N_("Set the priority of this configuration."),
       .off      = offsetof(satip_satconf_t, sfc_priority),
       .opts     = PO_ADVANCED,
     },
@@ -206,6 +358,7 @@ const idclass_t satip_satconf_class =
       .type     = PT_INT,
       .id       = "timeout",
       .name     = N_("Timeout (seconds)"),
+      .desc     = N_("Number of seconds to wait before timing out."),
       .off      = offsetof(satip_satconf_t, sfc_grace),
       .opts     = PO_ADVANCED,
       .def.i    = 10
@@ -214,14 +367,35 @@ const idclass_t satip_satconf_class =
       .type     = PT_INT,
       .id       = "position",
       .name     = N_("Position"),
+      .desc     = N_("Position of the input."),
       .off      = offsetof(satip_satconf_t, sfc_position),
       .def.i    = 1,
       .opts     = PO_RDONLY | PO_ADVANCED,
     },
     {
+      .type     = PT_INT,
+      .id       = "network_limit",
+      .name     = N_("Network limit per position"),
+      .desc     = N_("Concurrent limit per network position (src=) "
+                     "for satellite SAT>IP tuners. "
+                     "The first limit number is for src=1 (AA), second "
+                     "for src=2 (AB) etc."),
+      .opts     = PO_EXPERT,
+      .off      = offsetof(satip_satconf_t, sfc_network_limit),
+    },
+    {
+      .type     = PT_INT,
+      .id       = "network_group",
+      .name     = N_("Network group"),
+      .desc     = N_("Define network group to limit network usage."),
+      .opts     = PO_EXPERT,
+      .off      = offsetof(satip_satconf_t, sfc_network_group),
+    },
+    {
       .type     = PT_STR,
       .id       = "networks",
       .name     = N_("Networks"),
+      .desc     = N_("The networks using this configuration."),
       .islist   = 1,
       .set      = satip_satconf_class_network_set,
       .get      = satip_satconf_class_network_get,
@@ -292,6 +466,7 @@ satip_satconf_create
   if (lfe->sf_positions == 0)
     for ( ; lfe->sf_positions < def_positions; lfe->sf_positions++)
       satip_satconf_create0(lfe, NULL, lfe->sf_positions);
+  satip_satconf_sanity_check(lfe);
 }
 
 static void
@@ -300,6 +475,7 @@ satip_satconf_destroy0
 {
   satip_frontend_t *lfe = sfc->sfc_lfe;
   TAILQ_REMOVE(&lfe->sf_satconf, sfc, sfc_link);
+  idnode_save_check(&sfc->sfc_id, 1);
   idnode_unlink(&sfc->sfc_id);
   idnode_set_free(sfc->sfc_networks);
   free(sfc->sfc_name);
@@ -324,6 +500,7 @@ satip_satconf_updated_positions
     sfc = TAILQ_NEXT(sfc, sfc_link);
     satip_satconf_destroy0(sfc_old);
   }
+  satip_satconf_sanity_check(lfe);
 }
 
 void

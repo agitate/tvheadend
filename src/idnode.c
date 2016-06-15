@@ -32,7 +32,7 @@
 #include "access.h"
 
 static const idnodes_rb_t * idnode_domain ( const idclass_t *idc );
-static void idclass_root_register ( idnode_t *in );
+static idnodes_rb_t * idclass_find_domain ( const idclass_t *idc );
 
 typedef struct idclass_link
 {
@@ -41,13 +41,17 @@ typedef struct idclass_link
   RB_ENTRY(idclass_link) link;
 } idclass_link_t;
 
-static idnodes_rb_t           idnodes;
-static RB_HEAD(,idclass_link) idclasses;
-static RB_HEAD(,idclass_link) idrootclasses;
+static idnodes_rb_t             idnodes;
+static RB_HEAD(,idclass_link)   idclasses;
+static RB_HEAD(,idclass_link)   idrootclasses;
+static TAILQ_HEAD(,idnode_save) idnodes_save;
+
+tvh_cond_t save_cond;
+pthread_t save_tid;
+static int save_running;
+static mtimer_t save_timer;
 
 SKEL_DECLARE(idclasses_skel, idclass_link_t);
-
-char idnode_uuid_static[UUID_HEX_SIZE];
 
 /* **************************************************************************
  * Utilities
@@ -59,7 +63,7 @@ char idnode_uuid_static[UUID_HEX_SIZE];
 static int
 in_cmp(const idnode_t *a, const idnode_t *b)
 {
-  return memcmp(a->in_uuid, b->in_uuid, sizeof(a->in_uuid));
+  return uuid_cmp(&a->in_uuid, &b->in_uuid);
 }
 
 static int
@@ -73,35 +77,6 @@ ic_cmp ( const idclass_link_t *a, const idclass_link_t *b )
 /* **************************************************************************
  * Registration
  * *************************************************************************/
-
-/**
- *
- */
-pthread_t idnode_tid;
-
-void
-idnode_init(void)
-{
-  RB_INIT(&idnodes);
-  RB_INIT(&idclasses);
-  RB_INIT(&idrootclasses);
-}
-
-void
-idnode_done(void)
-{
-  idclass_link_t *il;
-
-  while ((il = RB_FIRST(&idclasses)) != NULL) {
-    RB_REMOVE(&idclasses, il, link);
-    free(il);
-  }
-  while ((il = RB_FIRST(&idrootclasses)) != NULL) {
-    RB_REMOVE(&idrootclasses, il, link);
-    free(il);
-  }
-  SKEL_FREE(idclasses_skel);
-}
 
 static const idclass_t *
 idnode_root_class(const idclass_t *idc)
@@ -122,6 +97,7 @@ idnode_insert(idnode_t *in, const char *uuid, const idclass_t *class, int flags)
   int retries = 5;
   uint32_t u32;
   const idclass_t *idc;
+  char ubuf[UUID_HEX_SIZE];
 
   lock_assert(&global_lock);
 
@@ -132,7 +108,7 @@ idnode_insert(idnode_t *in, const char *uuid, const idclass_t *class, int flags)
       in->in_class = NULL;
       return -1;
     }
-    memcpy(in->in_uuid, u.bin, sizeof(in->in_uuid));
+    uuid_copy(&in->in_uuid, &u);
 
     c = NULL;
     if (flags & IDNODE_SHORT_UUID) {
@@ -152,18 +128,20 @@ idnode_insert(idnode_t *in, const char *uuid, const idclass_t *class, int flags)
   } while (c != NULL && --retries > 0);
 
   if(c != NULL) {
-    tvherror("idnode", "Id node collission (%s) %s\n",
+    tvherror("idnode", "Id node collission (%s) %s",
              uuid, (flags & IDNODE_SHORT_UUID) ? " (short)" : "");
     fprintf(stderr, "Id node collision (%s) %s\n",
             uuid, (flags & IDNODE_SHORT_UUID) ? " (short)" : "");
     abort();
   }
-  tvhtrace("idnode", "insert node %s", idnode_uuid_as_sstr(in));
+  tvhtrace("idnode", "insert node %s", idnode_uuid_as_str(in, ubuf));
 
   /* Register the class */
-  idclass_register(class); // Note: we never actually unregister
-  idclass_root_register(in);
-  assert(in->in_domain);
+  in->in_domain = idclass_find_domain(class);
+  if (in->in_domain == NULL) {
+    tvherror("idnode", "classs '%s' is not registered", class->ic_class);
+    abort();
+  }
   c = RB_INSERT_SORTED(in->in_domain, in, in_domain_link, in_cmp);
   assert(c == NULL);
 
@@ -179,11 +157,14 @@ idnode_insert(idnode_t *in, const char *uuid, const idclass_t *class, int flags)
 void
 idnode_unlink(idnode_t *in)
 {
+  char ubuf[UUID_HEX_SIZE];
+
   lock_assert(&global_lock);
   RB_REMOVE(&idnodes, in, in_link);
   RB_REMOVE(in->in_domain, in, in_domain_link);
-  tvhtrace("idnode", "unlink node %s", idnode_uuid_as_sstr(in));
+  tvhtrace("idnode", "unlink node %s", idnode_uuid_as_str(in, ubuf));
   idnode_notify(in, "delete");
+  assert(in->in_save == NULL || in->in_save == SAVEPTR_OUTOFSERVICE);
 }
 
 /**
@@ -233,7 +214,7 @@ uint32_t
 idnode_get_short_uuid (const idnode_t *in)
 {
   uint32_t u32;
-  memcpy(&u32, in->in_uuid, sizeof(u32));
+  memcpy(&u32, in->in_uuid.bin, sizeof(u32));
   return u32 & 0x7FFFFFFF; // compat needs to be +ve signed
 }
 
@@ -243,7 +224,7 @@ idnode_get_short_uuid (const idnode_t *in)
 const char *
 idnode_uuid_as_str(const idnode_t *in, char *uuid)
 {
-  bin2hex(uuid, UUID_HEX_SIZE, in->in_uuid, sizeof(in->in_uuid));
+  bin2hex(uuid, UUID_HEX_SIZE, in->in_uuid.bin, sizeof(in->in_uuid.bin));
   return uuid;
 }
 
@@ -253,12 +234,13 @@ idnode_uuid_as_str(const idnode_t *in, char *uuid)
 const char *
 idnode_get_title(idnode_t *in, const char *lang)
 {
+  static char ubuf[UUID_HEX_SIZE];
   const idclass_t *ic = in->in_class;
   for(; ic != NULL; ic = ic->ic_super) {
     if(ic->ic_get_title != NULL)
       return ic->ic_get_title(in, lang);
   }
-  return idnode_uuid_as_sstr(in);
+  return idnode_uuid_as_str(in, ubuf);
 }
 
 
@@ -455,6 +437,33 @@ idnode_get_s64
 }
 
 /*
+ * Get field as signed 64-bit int
+ */
+int
+idnode_get_s64_atomic
+  ( idnode_t *self, const char *key, int64_t *s64 )
+{
+  const property_t *p = idnode_find_prop(self, key);
+  if (p) {
+    const void *ptr;
+    if (p->islist)
+      return 1;
+    else if (p->get)
+      ptr = p->get(self);
+    else
+      ptr = ((void*)self) + p->off;
+    switch (p->type) {
+      case PT_S64_ATOMIC:
+        *s64 = atomic_get_s64((int64_t*)ptr);
+        return 0;
+      default:
+        break;
+    }
+  }
+  return 1;
+}
+
+/*
  * Get field as double
  */
 int
@@ -606,7 +615,7 @@ idnode_find ( const char *uuid, const idclass_t *idc, const idnodes_rb_t *domain
   tvhtrace("idnode", "find node %s class %s", uuid, idc ? idc->ic_class : NULL);
   if(uuid == NULL || strlen(uuid) != UUID_HEX_SIZE - 1)
     return NULL;
-  if(hex2bin(skel.in_uuid, sizeof(skel.in_uuid), uuid))
+  if(hex2bin(skel.in_uuid.bin, sizeof(skel.in_uuid.bin), uuid))
     return NULL;
   if (domain == NULL)
     domain = idnode_domain(idc);
@@ -630,6 +639,7 @@ idnode_find_all ( const idclass_t *idc, const idnodes_rb_t *domain )
 {
   idnode_t *in;
   const idclass_t *ic;
+  char ubuf[UUID_HEX_SIZE];
   tvhtrace("idnode", "find class %s", idc->ic_class);
   idnode_set_t *is = calloc(1, sizeof(idnode_set_t));
   if (domain == NULL)
@@ -639,7 +649,7 @@ idnode_find_all ( const idclass_t *idc, const idnodes_rb_t *domain )
       ic = in->in_class;
       while (ic) {
         if (ic == idc) {
-          tvhtrace("idnode", "  add node %s", idnode_uuid_as_sstr(in));
+          tvhtrace("idnode", "  add node %s", idnode_uuid_as_str(in, ubuf));
           idnode_set_add(is, in, NULL, NULL);
           break;
         }
@@ -651,7 +661,7 @@ idnode_find_all ( const idclass_t *idc, const idnodes_rb_t *domain )
       ic = in->in_class;
       while (ic) {
         if (ic == idc) {
-          tvhtrace("idnode", "  add node %s", idnode_uuid_as_sstr(in));
+          tvhtrace("idnode", "  add node %s", idnode_uuid_as_str(in, ubuf));
           idnode_set_add(is, in, NULL, NULL);
           break;
         }
@@ -752,6 +762,17 @@ idnode_cmp_sort
           return safecmp(s64b, s64a);
       }
       break;
+    case PT_S64_ATOMIC:
+      {
+        int64_t s64a = 0, s64b = 0;
+        idnode_get_s64_atomic(ina, sort->key, &s64a);
+        idnode_get_s64_atomic(inb, sort->key, &s64b);
+        if (sort->dir == IS_ASC)
+          return safecmp(s64a, s64b);
+        else
+          return safecmp(s64b, s64a);
+      }
+      break;
     case PT_DBL:
       {
         double dbla = 0, dblb = 0;
@@ -796,8 +817,8 @@ idnode_filter_init
         if (p->type == PT_U32 || p->type == PT_S64 ||
             p->type == PT_TIME) {
           int64_t v = f->u.n.n;
-          if (p->intsplit != f->u.n.intsplit) {
-            v = (v / MIN(1, f->u.n.intsplit)) * p->intsplit;
+          if (INTEXTRA_IS_SPLIT(p->intextra) && p->intextra != f->u.n.intsplit) {
+            v = (v / MIN(1, f->u.n.intsplit)) * p->intextra;
             f->u.n.n = v;
           }
         }
@@ -959,6 +980,16 @@ idnode_filter_clear
 }
 
 void
+idnode_set_alloc
+  ( idnode_set_t *is, size_t alloc )
+{
+  if (is->is_alloc < alloc) {
+    is->is_alloc = alloc;
+    is->is_array = realloc(is->is_array, alloc * sizeof(idnode_t*));
+  }
+}
+
+void
 idnode_set_add
   ( idnode_set_t *is, idnode_t *in, idnode_filter_t *filt, const char *lang )
 {
@@ -966,10 +997,8 @@ idnode_set_add
     return;
   
   /* Allocate more space */
-  if (is->is_alloc == is->is_count) {
-    is->is_alloc = MAX(100, is->is_alloc * 2);
-    is->is_array = realloc(is->is_array, is->is_alloc * sizeof(idnode_t*));
-  }
+  if (is->is_alloc == is->is_count)
+    idnode_set_alloc(is, MAX(100, is->is_alloc * 2));
   if (is->is_sorted) {
     size_t i;
     idnode_t **a = is->is_array;
@@ -1014,8 +1043,9 @@ idnode_set_remove
 {
   ssize_t i = idnode_set_find_index(is, in);
   if (i >= 0) {
-    memmove(&is->is_array[i], &is->is_array[i+1],
-            (is->is_count - i - 1) * sizeof(idnode_t *));
+    if (is->is_count > 1)
+      memmove(&is->is_array[i], &is->is_array[i+1],
+              (is->is_count - i - 1) * sizeof(idnode_t *));
     is->is_count--;
     return 1;
   }
@@ -1041,10 +1071,19 @@ idnode_set_as_htsmsg
   ( idnode_set_t *is )
 {
   htsmsg_t *l = htsmsg_create_list();
+  char ubuf[UUID_HEX_SIZE];
   int i;
   for (i = 0; i < is->is_count; i++)
-    htsmsg_add_str(l, NULL, idnode_uuid_as_sstr(is->is_array[i]));
+    htsmsg_add_str(l, NULL, idnode_uuid_as_str(is->is_array[i], ubuf));
   return l;
+}
+
+void
+idnode_set_clear ( idnode_set_t *is )
+{
+  free(is->is_array);
+  is->is_array = NULL;
+  is->is_count = is->is_alloc = 0;
 }
 
 void
@@ -1070,15 +1109,72 @@ idnode_class_write_values
 }
 
 static void
-idnode_savefn ( idnode_t *self )
+idnode_changedfn ( idnode_t *self )
 {
   const idclass_t *idc = self->in_class;
   while (idc) {
-    if (idc->ic_save) {
-      idc->ic_save(self);
+    if (idc->ic_changed) {
+      idc->ic_changed(self);
       break;
     }
     idc = idc->ic_super;
+  }
+}
+
+static htsmsg_t *
+idnode_savefn ( idnode_t *self, char *filename, size_t fsize )
+{
+  const idclass_t *idc = self->in_class;
+  while (idc) {
+    if (idc->ic_save)
+      return idc->ic_save(self, filename, fsize);
+    idc = idc->ic_super;
+  }
+  return NULL;
+}
+
+static void
+idnode_save_trigger_thread_cb( void *aux )
+{
+  tvh_cond_signal(&save_cond, 0);
+}
+
+static void
+idnode_save_queue ( idnode_t *self )
+{
+  idnode_save_t *ise;
+
+  if (self->in_save)
+    return;
+  ise = malloc(sizeof(*ise));
+  ise->ise_node = self;
+  ise->ise_reqtime = mclk();
+  if (TAILQ_EMPTY(&idnodes_save) && atomic_get(&save_running))
+    mtimer_arm_rel(&save_timer, idnode_save_trigger_thread_cb, NULL, IDNODE_SAVE_DELAY);
+  TAILQ_INSERT_TAIL(&idnodes_save, ise, ise_link);
+  self->in_save = ise;
+}
+
+void
+idnode_save_check ( idnode_t *self, int weak )
+{
+  char filename[PATH_MAX];
+  htsmsg_t *m;
+
+  if (self->in_save == NULL || self->in_save == SAVEPTR_OUTOFSERVICE)
+    return;
+
+  TAILQ_REMOVE(&idnodes_save, self->in_save, ise_link);
+  free(self->in_save);
+  self->in_save = SAVEPTR_OUTOFSERVICE;
+
+  if (weak)
+    return;
+
+  m = idnode_savefn(self, filename, sizeof(filename));
+  if (m) {
+    hts_settings_save(m, "%s", filename);
+    htsmsg_destroy(m);
   }
 }
 
@@ -1088,8 +1184,10 @@ idnode_write0 ( idnode_t *self, htsmsg_t *c, int optmask, int dosave )
   int save = 0;
   const idclass_t *idc = self->in_class;
   save = idnode_class_write_values(self, idc, c, optmask);
-  if (save && dosave)
-    idnode_savefn(self);
+  if ((idc->ic_flags & IDCLASS_ALWAYS_SAVE) != 0 || (save && dosave)) {
+    idnode_changedfn(self);
+    idnode_save_queue(self);
+  }
   if (dosave)
     idnode_notify_changed(self);
   // Note: always output event if "dosave", reason is that UI updates on
@@ -1104,7 +1202,7 @@ void
 idnode_changed( idnode_t *self )
 {
   idnode_notify_changed(self);
-  idnode_savefn(self);
+  idnode_save_queue(self);
 }
 
 /* **************************************************************************
@@ -1200,6 +1298,17 @@ idclass_get_order (const idclass_t *idc)
   return NULL;
 }
 
+const char **
+idclass_get_doc (const idclass_t *idc)
+{
+  while (idc) {
+    if (idc->ic_doc)
+      return idc->ic_doc;
+    idc = idc->ic_super;
+  }
+  return NULL;
+}
+
 static htsmsg_t *
 idclass_get_property_groups (const idclass_t *idc, const char *lang)
 {
@@ -1231,39 +1340,51 @@ idclass_get_property_groups (const idclass_t *idc, const char *lang)
   return NULL;
 }
 
-void
-idclass_register(const idclass_t *idc)
+static idnodes_rb_t *
+idclass_find_domain(const idclass_t *idc)
 {
-  while (idc) {
-    SKEL_ALLOC(idclasses_skel);
-    idclasses_skel->idc = idc;
-    if (RB_INSERT_SORTED(&idclasses, idclasses_skel, link, ic_cmp))
-      break;
-    RB_INIT(&idclasses_skel->nodes); /* not used, but for sure */
-    SKEL_USED(idclasses_skel);
-    tvhtrace("idnode", "register class %s", idc->ic_class);
-    idc = idc->ic_super;
-  }
-}
-
-static void
-idclass_root_register(idnode_t *in)
-{
-  const idclass_t *idc = in->in_class;
   idclass_link_t *r;
   idc = idnode_root_class(idc);
   SKEL_ALLOC(idclasses_skel);
   idclasses_skel->idc = idc;
+  r = RB_FIND(&idrootclasses, idclasses_skel, link, ic_cmp);
+  if (r)
+    return &r->nodes;
+  return NULL;
+}
+
+static void
+idclass_root_register(const idclass_t *idc)
+{
+  idclass_link_t *r;
+  SKEL_ALLOC(idclasses_skel);
+  idclasses_skel->idc = idc;
   r = RB_INSERT_SORTED(&idrootclasses, idclasses_skel, link, ic_cmp);
-  if (r) {
-    in->in_domain = &r->nodes;
-    return;
-  }
+  if (r) return;
   RB_INIT(&idclasses_skel->nodes);
-  r = idclasses_skel;
   SKEL_USED(idclasses_skel);
   tvhtrace("idnode", "register root class %s", idc->ic_class);
-  in->in_domain = &r->nodes;
+}
+
+void
+idclass_register(const idclass_t *idc)
+{
+  const idclass_t *prev = NULL;
+  while (idc) {
+    SKEL_ALLOC(idclasses_skel);
+    idclasses_skel->idc = idc;
+    if (RB_INSERT_SORTED(&idclasses, idclasses_skel, link, ic_cmp)) {
+      prev = NULL;
+      break;
+    }
+    RB_INIT(&idclasses_skel->nodes); /* not used, but for sure */
+    SKEL_USED(idclasses_skel);
+    tvhtrace("idnode", "register class %s", idc->ic_class);
+    prev = idc;
+    idc = idc->ic_super;
+  }
+  if (prev)
+    idclass_root_register(prev);
 }
 
 const idclass_t *
@@ -1276,6 +1397,53 @@ idclass_find ( const char *class )
   tvhtrace("idnode", "find class %s", class);
   t = RB_FIND(&idclasses, &skel, link, ic_cmp);
   return t ? t->idc : NULL;
+}
+
+idclass_t const **
+idclass_find_all(void)
+{
+  idclass_link_t *l;
+  idclass_t const **ret;
+  int i = 0, count = 0;
+  RB_FOREACH(l, &idclasses, link)
+    count++;
+  if (count == 0)
+    return NULL;
+  ret = calloc(count + 1, sizeof(idclass_t *));
+  RB_FOREACH(l, &idclasses, link)
+    ret[i++] = l->idc;
+  ret[i] = NULL;
+  return ret;
+}
+
+idclass_t const **
+idclass_find_children(const char *clazz)
+{
+  const idclass_t *ic = idclass_find(clazz), *root;
+  idclass_link_t *l;
+  idclass_t const **ret;
+  int i, count;
+
+  if (ic == NULL)
+    return NULL;
+  root = idnode_root_class(ic);
+  if (root == NULL)
+    return NULL;
+  ret = NULL;
+  count = i = 0;
+  RB_FOREACH(l, &idclasses, link) {
+    if (root == idnode_root_class(l->idc)) {
+      if (i <= count) {
+        count += 50;
+        ret = realloc(ret, count * sizeof(const idclass_t *));
+      }
+      ret[i++] = ic;
+    }
+  }
+  if (i <= count)
+    ret = realloc(ret, (count + 1) * sizeof(const idclass_t *));
+  ret[i] = NULL;
+  return ret;
 }
 
 /*
@@ -1314,10 +1482,11 @@ idnode_serialize0(idnode_t *self, htsmsg_t *list, int optmask, const char *lang)
 {
   const idclass_t *idc = self->in_class;
   const char *uuid, *s;
+  char ubuf[UUID_HEX_SIZE];
 
   htsmsg_t *m = htsmsg_create_map();
   if (!idc->ic_snode) {
-    uuid = idnode_uuid_as_sstr(self);
+    uuid = idnode_uuid_as_str(self, ubuf);
     htsmsg_add_str(m, "uuid", uuid);
     htsmsg_add_str(m, "id",   uuid);
   }
@@ -1335,6 +1504,90 @@ idnode_serialize0(idnode_t *self, htsmsg_t *list, int optmask, const char *lang)
 }
 
 /* **************************************************************************
+ * Simple list helpers
+ * *************************************************************************/
+
+htsmsg_t *
+idnode_slist_enum ( idnode_t *in, idnode_slist_t *options, const char *lang )
+{
+  htsmsg_t *l = htsmsg_create_list(), *m;
+
+  for (; options->id; options++) {
+    m = htsmsg_create_map();
+    htsmsg_add_str(m, "key", options->id);
+    htsmsg_add_str(m, "val", tvh_gettext_lang(lang, options->name));
+    htsmsg_add_msg(l, NULL, m);
+  }
+  return l;
+}
+
+htsmsg_t *
+idnode_slist_get ( idnode_t *in, idnode_slist_t *options )
+{
+  htsmsg_t *l = htsmsg_create_list();
+  int *ip;
+
+  for (; options->id; options++) {
+    ip = (void *)in + options->off;
+    if (*ip)
+      htsmsg_add_str(l, NULL, options->id);
+  }
+  return l;
+}
+
+int
+idnode_slist_set ( idnode_t *in, idnode_slist_t *options, const htsmsg_t *vals )
+{
+  idnode_slist_t *o;
+  htsmsg_field_t *f;
+  int *ip, changed = 0;
+  const char *s;
+
+  for (o = options; o->id; o++) {
+    ip = (void *)in + o->off;
+    if (!changed) {
+      HTSMSG_FOREACH(f, vals) {
+        if ((s = htsmsg_field_get_str(f)) != NULL)
+          continue;
+        if (strcmp(s, o->id))
+          continue;
+        if (*ip == 0) changed = 1;
+        break;
+      }
+      if (f == NULL && *ip) changed = 1;
+    }
+    *ip = 0;
+  }
+  HTSMSG_FOREACH(f, vals) {
+    if ((s = htsmsg_field_get_str(f)) == NULL)
+      continue;
+    for (o = options; o->id; o++) {
+      if (strcmp(o->id, s)) continue;
+      ip = (void *)in + o->off;
+      *ip = 1;
+      break;
+    }
+  }
+  return changed;
+}
+
+char *
+idnode_slist_rend ( idnode_t *in, idnode_slist_t *options, const char *lang )
+{
+  int *ip;
+  size_t l = 0;
+
+  prop_sbuf[0] = '\0';
+  for (; options->id; options++) {
+    ip = (void *)in + options->off;
+    if (*ip)
+     tvh_strlcatf(prop_sbuf, PROP_SBUF_LEN, l, "%s%s", prop_sbuf[0] ? "," : "",
+                   tvh_gettext_lang(lang, options->name));
+  }
+  return prop_sbuf_ptr;
+}
+
+/* **************************************************************************
  * List helpers
  * *************************************************************************/
 
@@ -1346,12 +1599,12 @@ idnode_list_notify ( idnode_list_mapping_t *ilm, void *origin )
   if (origin == ilm->ilm_in1) {
     idnode_notify_changed(ilm->ilm_in2);
     if (ilm->ilm_in2_save)
-      idnode_savefn(ilm->ilm_in2);
+      idnode_save_queue(ilm->ilm_in2);
   }
   if (origin == ilm->ilm_in2) {
     idnode_notify_changed(ilm->ilm_in1);
     if (ilm->ilm_in1_save)
-      idnode_savefn(ilm->ilm_in1);
+      idnode_save_queue(ilm->ilm_in1);
   }
 }
 
@@ -1447,9 +1700,10 @@ idnode_list_get1
 {
   idnode_list_mapping_t *ilm;
   htsmsg_t *l = htsmsg_create_list();
+  char ubuf[UUID_HEX_SIZE];
 
   LIST_FOREACH(ilm, in1_list, ilm_in1_link)
-    htsmsg_add_str(l, NULL, idnode_uuid_as_sstr(ilm->ilm_in2));
+    htsmsg_add_str(l, NULL, idnode_uuid_as_str(ilm->ilm_in2, ubuf));
   return l;
 }
 
@@ -1459,9 +1713,10 @@ idnode_list_get2
 {
   idnode_list_mapping_t *ilm;
   htsmsg_t *l = htsmsg_create_list();
+  char ubuf[UUID_HEX_SIZE];
 
   LIST_FOREACH(ilm, in2_list, ilm_in2_link)
-    htsmsg_add_str(l, NULL, idnode_uuid_as_sstr(ilm->ilm_in1));
+    htsmsg_add_str(l, NULL, idnode_uuid_as_str(ilm->ilm_in1, ubuf));
   return l;
 }
 
@@ -1587,9 +1842,10 @@ void
 idnode_notify ( idnode_t *in, const char *action )
 {
   const idclass_t *ic = in->in_class;
-  const char *uuid = idnode_uuid_as_sstr(in);
+  char ubuf[UUID_HEX_SIZE];
+  const char *uuid = idnode_uuid_as_str(in, ubuf);
 
-  if (!tvheadend_running)
+  if (!tvheadend_is_running())
     return;
 
   while (ic) {
@@ -1612,11 +1868,109 @@ idnode_notify_changed (void *in)
 void
 idnode_notify_title_changed (void *in, const char *lang)
 {
+  char ubuf[UUID_HEX_SIZE];
   htsmsg_t *m = htsmsg_create_map();
-  htsmsg_add_str(m, "uuid", idnode_uuid_as_sstr(in));
+  htsmsg_add_str(m, "uuid", idnode_uuid_as_str(in, ubuf));
   htsmsg_add_str(m, "text", idnode_get_title(in, lang));
   notify_by_msg("title", m, 0);
   idnode_notify_changed(in);
+}
+
+/* **************************************************************************
+ * Save thread
+ * *************************************************************************/
+
+static void *
+save_thread ( void *aux )
+{
+  idnode_save_t *ise;
+  htsmsg_t *m;
+  char filename[PATH_MAX];
+
+  tvhtread_renice(15);
+
+  pthread_mutex_lock(&global_lock);
+
+  while (atomic_get(&save_running)) {
+    if ((ise = TAILQ_FIRST(&idnodes_save)) == NULL ||
+        (ise->ise_reqtime + IDNODE_SAVE_DELAY > mclk())) {
+      if (ise)
+        mtimer_arm_abs(&save_timer, idnode_save_trigger_thread_cb, NULL,
+                       ise->ise_reqtime + IDNODE_SAVE_DELAY);
+      tvh_cond_wait(&save_cond, &global_lock);
+      continue;
+    }
+    m = idnode_savefn(ise->ise_node, filename, sizeof(filename));
+    ise->ise_node->in_save = NULL;
+    TAILQ_REMOVE(&idnodes_save, ise, ise_link);
+    pthread_mutex_unlock(&global_lock);
+    free(ise);
+    if (m) {
+      hts_settings_save(m, "%s", filename);
+      htsmsg_destroy(m);
+    }
+    pthread_mutex_lock(&global_lock);
+  }
+
+  mtimer_disarm(&save_timer);
+
+  while ((ise = TAILQ_FIRST(&idnodes_save)) != NULL) {
+    m = idnode_savefn(ise->ise_node, filename, sizeof(filename));
+    ise->ise_node->in_save = NULL;
+    TAILQ_REMOVE(&idnodes_save, ise, ise_link);
+    pthread_mutex_unlock(&global_lock);
+    free(ise);
+    if (m) {
+      hts_settings_save(m, "%s", filename);
+      htsmsg_destroy(m);
+    }
+    pthread_mutex_lock(&global_lock);
+  }
+
+  pthread_mutex_unlock(&global_lock);
+  return NULL;
+}
+
+/* **************************************************************************
+ * Initialization
+ * *************************************************************************/
+
+void
+idnode_boot(void)
+{
+  RB_INIT(&idnodes);
+  RB_INIT(&idclasses);
+  RB_INIT(&idrootclasses);
+  TAILQ_INIT(&idnodes_save);
+  tvh_cond_init(&save_cond);
+}
+
+void
+idnode_init(void)
+{
+  atomic_set(&save_running, 1);
+  tvhthread_create(&save_tid, NULL, save_thread, NULL, "save");
+}
+
+void
+idnode_done(void)
+{
+  idclass_link_t *il;
+
+  atomic_set(&save_running, 0);
+  tvh_cond_signal(&save_cond, 0);
+  pthread_join(save_tid, NULL);
+  mtimer_disarm(&save_timer);
+
+  while ((il = RB_FIRST(&idclasses)) != NULL) {
+    RB_REMOVE(&idclasses, il, link);
+    free(il);
+  }
+  while ((il = RB_FIRST(&idrootclasses)) != NULL) {
+    RB_REMOVE(&idrootclasses, il, link);
+    free(il);
+  }
+  SKEL_FREE(idclasses_skel);
 }
 
 /******************************************************************************

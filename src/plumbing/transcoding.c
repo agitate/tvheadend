@@ -401,7 +401,7 @@ transcoder_stream_subtitle(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *p
   AVCodecContext *ictx;
   AVPacket packet;
   AVSubtitle sub;
-  int length,  got_subtitle;
+  int length, got_subtitle;
 
   subtitle_stream_t *ss = (subtitle_stream_t*)ts;
 
@@ -411,12 +411,13 @@ transcoder_stream_subtitle(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *p
   icodec = ss->sub_icodec;
   //ocodec = ss->sub_ocodec;
 
+
   if (!avcodec_is_open(ictx)) {
     if (avcodec_open2(ictx, icodec, NULL) < 0) {
       tvherror("transcode", "%04X: Unable to open %s decoder",
                shortid(t), icodec->name);
       transcoder_stream_invalidate(ts);
-      goto cleanup;
+      return;
     }
   }
 
@@ -426,6 +427,8 @@ transcoder_stream_subtitle(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *p
   packet.pts      = pkt->pkt_pts;
   packet.dts      = pkt->pkt_dts;
   packet.duration = pkt->pkt_duration;
+
+  memset(&sub, 0, sizeof(sub));
 
   length = avcodec_decode_subtitle2(ictx,  &sub, &got_subtitle, &packet);
   if (length <= 0) {
@@ -494,6 +497,8 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   icodec = as->aud_icodec;
   ocodec = as->aud_ocodec;
 
+  av_init_packet(&packet);
+
   if (!avcodec_is_open(ictx)) {
     if (icodec->id == AV_CODEC_ID_AAC || icodec->id == AV_CODEC_ID_VORBIS) {
       if (ts->ts_input_gh) {
@@ -523,7 +528,6 @@ transcoder_stream_audio(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
     as->aud_dec_pts += (pkt->pkt_pts - as->aud_dec_pts);
   }
 
-  av_init_packet(&packet);
   packet.data     = pktbuf_ptr(pkt->pkt_payload);
   packet.size     = pktbuf_len(pkt->pkt_payload);
   packet.pts      = pkt->pkt_pts;
@@ -1162,7 +1166,7 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   video_stream_t *vs = (video_stream_t*)ts;
   streaming_message_t *sm;
   th_pkt_t *pkt2;
-  static int max_bitrate = (INT_MAX / 3000) * 0.8;
+  static int max_bitrate = INT_MAX / ((3000*10)/8);
 
   av_init_packet(&packet);
   av_init_packet(&packet2);
@@ -1331,12 +1335,9 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
       octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
 
       // Default = "medium". We gain more encoding speed compared to the loss of quality when lowering it _slightly_.
-      if (!strcmp(ocodec->name, "nvenc"))
-         av_dict_set(&opts, "preset",  "hq", 0);
-      else if (!strcmp(ocodec->name, "h264_qsv"))
-         av_dict_set(&opts, "preset",  "medium", 0);
-      else
-         av_dict_set(&opts, "preset",  "faster", 0);
+      // select preset according to system performance and codec type
+      av_dict_set(&opts, "preset",  t->t_props.tp_vcodec_preset, 0);
+      tvhinfo("transcode", "%04X: Using preset %s", shortid(t), t->t_props.tp_vcodec_preset);
 
       // All modern devices should support "high" profile
       av_dict_set(&opts, "profile", "high", 0);
@@ -1365,7 +1366,10 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
       octx->flags         |= CODEC_FLAG_GLOBAL_HEADER;
 
       // on all hardware ultrafast (or maybe superfast) should be safe
-      av_dict_set(&opts, "preset", "ultrafast",  0);
+      // select preset according to system performance
+      av_dict_set(&opts, "preset",  t->t_props.tp_vcodec_preset, 0);
+      tvhinfo("transcode", "%04X: Using preset %s", shortid(t), t->t_props.tp_vcodec_preset);
+
       // disables encoder features which tend to be bottlenecks for the decoder/player
       av_dict_set(&opts, "tune",   "fastdecode", 0);
 
@@ -1431,6 +1435,7 @@ transcoder_stream_video(transcoder_t *t, transcoder_stream_t *ts, th_pkt_t *pkt)
   }
 
   /* and pull out a filtered frame */
+  got_output = 0;
   while (1) {
 	ret = av_buffersink_get_frame(vs->flt_bufsinkctx, vs->vid_enc_frame);
 	if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
@@ -1910,8 +1915,8 @@ transcoder_calc_stream_count(transcoder_t *t, streaming_start_t *ss) {
     }
   }
 
-  tvhtrace("transcode", "%04X: transcoder_calc_stream_count=%d",
-           shortid(t), (video + audio + subtitle));
+  tvhtrace("transcode", "%04X: transcoder_calc_stream_count=%d (video=%d, audio=%d, subtitle=%d)",
+           shortid(t), (video + audio + subtitle), video, audio, subtitle);
 
 
   return (video + audio + subtitle);
@@ -1926,7 +1931,8 @@ transcoder_start(transcoder_t *t, streaming_start_t *src)
 {
   int i, j, n, rc;
   streaming_start_t *ss;
-
+  transcoder_props_t *tp = &t->t_props;
+  char* requested_lang;
 
   n = transcoder_calc_stream_count(t, src);
   ss = calloc(1, (sizeof(streaming_start_t) +
@@ -1938,6 +1944,22 @@ transcoder_start(transcoder_t *t, streaming_start_t *src)
   ss->ss_pmt_pid        = src->ss_pmt_pid;
   service_source_info_copy(&ss->ss_si, &src->ss_si);
 
+  requested_lang = tp->tp_language;
+
+  if (requested_lang[0] != '\0')
+  {
+      for (i = 0; i < src->ss_num_components; i++) {
+        streaming_start_component_t *ssc_src = &src->ss_components[i];
+        if (SCT_ISAUDIO(ssc_src->ssc_type) && !strcmp(tp->tp_language, ssc_src->ssc_lang))
+          break;
+      }
+
+      if (i == src->ss_num_components)
+      {
+        tvhinfo("transcode", "Could not find requestd lang [%s] in stream, using first one", tp->tp_language);
+        requested_lang[0] = '\0';
+      }
+  }
 
   for (i = j = 0; i < src->ss_num_components && j < n; i++) {
     streaming_start_component_t *ssc_src = &src->ss_components[i];
@@ -1950,10 +1972,8 @@ transcoder_start(transcoder_t *t, streaming_start_t *src)
 
     if (SCT_ISVIDEO(ssc->ssc_type))
       rc = transcoder_init_video(t, ssc);
-
-    else if (SCT_ISAUDIO(ssc->ssc_type))
+    else if (SCT_ISAUDIO(ssc->ssc_type) && (requested_lang[0] == '\0' || !strcmp(requested_lang, ssc->ssc_lang)))
       rc = transcoder_init_audio(t, ssc);
-
     else if (SCT_ISSUBTITLE(ssc->ssc_type))
       rc = transcoder_init_subtitle(t, ssc);
     else
@@ -2065,6 +2085,7 @@ transcoder_set_properties(streaming_target_t *st,
   transcoder_props_t *tp = &t->t_props;
 
   strncpy(tp->tp_vcodec, props->tp_vcodec, sizeof(tp->tp_vcodec)-1);
+  strncpy(tp->tp_vcodec_preset, props->tp_vcodec_preset, sizeof(tp->tp_vcodec_preset)-1);
   strncpy(tp->tp_acodec, props->tp_acodec, sizeof(tp->tp_acodec)-1);
   strncpy(tp->tp_scodec, props->tp_scodec, sizeof(tp->tp_scodec)-1);
   tp->tp_channels   = props->tp_channels;
@@ -2108,8 +2129,10 @@ transcoder_get_capabilities(int experimental)
     if (!WORKING_ENCODER(p->id))
       continue;
 
-    if ((p->capabilities & CODEC_CAP_EXPERIMENTAL) && !experimental)
+    if (((p->capabilities & CODEC_CAP_EXPERIMENTAL) && !experimental) ||
+        (p->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE)) {
       continue;
+    }
 
     sct = codec_id2streaming_component_type(p->id);
     if (sct == SCT_NONE || sct == SCT_UNKNOWN)

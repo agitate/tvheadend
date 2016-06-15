@@ -58,7 +58,7 @@ epggrab_channel_t *epggrab_channel_find
 
 void epggrab_channel_save ( epggrab_channel_t *ec );
 void epggrab_channel_destroy
-  ( epggrab_channel_t *ec, int delconf );
+  ( epggrab_channel_t *ec, int delconf, int rb_remove );
 void epggrab_channel_flush
   ( epggrab_module_t *mod, int delconf );
 void epggrab_channel_begin_scan
@@ -87,7 +87,7 @@ epggrab_module_int_t *epggrab_module_int_create
  * *************************************************************************/
 
 epggrab_module_ext_t *epggrab_module_ext_create
-  ( epggrab_module_ext_t *skel,
+  ( epggrab_module_ext_t *skel, const idclass_t *cls,
     const char *id, const char *saveid,
     const char *name, int priority,
     const char *sockid,
@@ -176,11 +176,24 @@ epggrab_ota_service_del
 
 /* Note: this is reused by pyepg since they share a common format */
 int  xmltv_parse_accessibility
-  ( epggrab_module_t *mod, epg_broadcast_t *ebc, htsmsg_t *m );
+  ( epg_broadcast_t *ebc, htsmsg_t *m, uint32_t *changes );
 
 /* Freesat huffman decoder */
 size_t freesat_huffman_decode
-  (char *dst, size_t* dstlen, const uint8_t *src, size_t srclen);
+  ( char *dst, size_t* dstlen, const uint8_t *src, size_t srclen );
+
+/* **************************************************************************
+ * Classes
+ * *************************************************************************/
+
+extern const idclass_t epggrab_mod_class;
+extern const idclass_t epggrab_mod_int_class;
+extern const idclass_t epggrab_mod_int_pyepg_class;
+extern const idclass_t epggrab_mod_int_xmltv_class;
+extern const idclass_t epggrab_mod_ext_class;
+extern const idclass_t epggrab_mod_ext_pyepg_class;
+extern const idclass_t epggrab_mod_ext_xmltv_class;
+extern const idclass_t epggrab_mod_ota_class;
 
 /* **************************************************************************
  * Module setup(s)

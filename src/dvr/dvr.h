@@ -26,6 +26,18 @@
 #include "muxer.h"
 #include "profile.h"
 #include "lang_str.h"
+#include "tvhvfs.h"
+
+#define DVR_MAX_DATA_ERRORS     (10000)
+
+#define DVR_FILESIZE_UPDATE     (1<<0)
+#define DVR_FILESIZE_TOTAL      (1<<1)
+
+typedef struct dvr_vfs {
+  LIST_ENTRY(dvr_vfs) link;
+  tvh_fsid_t fsid;
+  uint64_t used_size;
+} dvr_vfs_t;
 
 typedef struct dvr_config {
   idnode_t dvr_id;
@@ -47,6 +59,7 @@ typedef struct dvr_config {
   uint32_t dvr_autorec_max_sched_count;
   char *dvr_charset;
   char *dvr_charset_id;
+  char *dvr_preproc;
   char *dvr_postproc;
   char *dvr_postremove;
   uint32_t dvr_warm_time;
@@ -85,10 +98,6 @@ typedef struct dvr_config {
 
 } dvr_config_t;
 
-extern struct dvr_config_list dvrconfigs;
-
-extern struct dvr_entry_list dvrentries;
-
 typedef enum {
   DVR_PRIO_IMPORTANT   = 0,
   DVR_PRIO_HIGH        = 1,
@@ -97,10 +106,6 @@ typedef enum {
   DVR_PRIO_UNIMPORTANT = 4,
   DVR_PRIO_NOTSET      = 5,
 } dvr_prio_t;
-
-
-LIST_HEAD(dvr_rec_stream_list, dvr_rec_stream);
-
 
 typedef enum {
   DVR_SCHEDULED,         /* Scheduled for recording (in the future) */
@@ -131,12 +136,12 @@ typedef enum {
   DVR_RET_2WEEK     = 14,
   DVR_RET_3WEEK     = 21,
   DVR_RET_1MONTH    = (30+1),
-  DVR_RET_2MONTH    = (60+1),
+  DVR_RET_2MONTH    = (60+2),
   DVR_RET_3MONTH    = (90+2),
-  DVR_RET_6MONTH    = (180+2),
+  DVR_RET_6MONTH    = (180+3),
   DVR_RET_1YEAR     = (365+1),
   DVR_RET_2YEARS    = (2*365+1),
-  DVR_RET_3YEARS    = (3*366+1),
+  DVR_RET_3YEARS    = (3*365+1),
   DVR_RET_ONREMOVE  = INT32_MAX-1, // for retention only
   DVR_RET_SPACE     = INT32_MAX-1, // for removal only
   DVR_RET_FOREVER   = INT32_MAX
@@ -162,6 +167,7 @@ typedef struct dvr_entry {
   char *de_channel_name;
 
   gtimer_t de_timer;
+  mtimer_t de_deferred_timer;
 
   /**
    * These meta fields will stay valid as long as reference count > 0
@@ -264,16 +270,9 @@ typedef struct dvr_entry {
   profile_chain_t *de_chain;
 
   /**
-   * Inotify
-   */
-#if ENABLE_INOTIFY
-  LIST_ENTRY(dvr_entry) de_inotify_link;
-#endif
-
-  /**
    * Entry change notification timer
    */
-  time_t de_last_notify;
+  int64_t de_last_notify;
 
   /**
    * Update notification limit
@@ -290,9 +289,20 @@ typedef enum {
   DVR_AUTOREC_RECORD_DIFFERENT_SUBTITLE = 2,
   DVR_AUTOREC_RECORD_DIFFERENT_DESCRIPTION = 3,
   DVR_AUTOREC_RECORD_ONCE_PER_WEEK = 4,
-  DVR_AUTOREC_RECORD_ONCE_PER_DAY = 5
+  DVR_AUTOREC_RECORD_ONCE_PER_DAY = 5,
+  DVR_AUTOREC_LRECORD_DIFFERENT_EPISODE_NUMBER = 6,
+  DVR_AUTOREC_LRECORD_DIFFERENT_TITLE = 7,
+  DVR_AUTOREC_LRECORD_DIFFERENT_SUBTITLE = 8,
+  DVR_AUTOREC_LRECORD_DIFFERENT_DESCRIPTION = 9,
+  DVR_AUTOREC_LRECORD_ONCE_PER_WEEK = 10,
+  DVR_AUTOREC_LRECORD_ONCE_PER_DAY = 11,
 } dvr_autorec_dedup_t;
 
+typedef enum {
+  DVR_AUTOREC_BTYPE_ALL = 0,
+  DVR_AUTOREC_BTYPE_NEW = 1,
+  DVR_AUTOREC_BTYPE_REPEAT = 2
+} dvr_autorec_btype_t;
 
 /**
  * Autorec entry
@@ -342,6 +352,7 @@ typedef struct dvr_autorec_entry {
   int dae_maxduration;
   uint32_t dae_retention;
   uint32_t dae_removal;
+  uint32_t dae_btype;
   uint32_t dae_max_count;
   uint32_t dae_max_sched_count;
 
@@ -405,6 +416,10 @@ extern const idclass_t dvr_entry_class;
 extern const idclass_t dvr_autorec_entry_class;
 extern const idclass_t dvr_timerec_entry_class;
 
+extern struct dvr_vfs_list dvrvfs_list;
+extern struct dvr_config_list dvrconfigs;
+extern struct dvr_entry_list dvrentries;
+
 /**
  * Prototypes
  */
@@ -428,13 +443,13 @@ static inline dvr_config_t *dvr_config_find_by_uuid(const char *uuid)
 
 void dvr_config_delete(const char *name);
 
-void dvr_config_save(dvr_config_t *cfg);
+void dvr_config_changed(dvr_config_t *cfg);
 
 void dvr_config_destroy_by_profile(profile_t *pro, int delconf);
 
 static inline uint32_t dvr_retention_cleanup(uint32_t val)
 {
-  return (val > 0xffffffff - 86400) ? (0xffffffff - 86400) : val;
+  return val > DVR_RET_FOREVER ? DVR_RET_FOREVER : val;
 }
 
 /*
@@ -451,9 +466,9 @@ static inline int dvr_entry_is_valid(dvr_entry_t *de)
 
 int dvr_entry_get_mc(dvr_entry_t *de);
 
-const char *dvr_entry_get_retention_string ( dvr_entry_t *de );
+char *dvr_entry_get_retention_string ( dvr_entry_t *de );
 
-const char *dvr_entry_get_removal_string ( dvr_entry_t *de );
+char *dvr_entry_get_removal_string ( dvr_entry_t *de );
 
 uint32_t dvr_entry_get_retention_days( dvr_entry_t *de );
 
@@ -474,8 +489,6 @@ time_t dvr_entry_get_extra_time_pre( dvr_entry_t *de );
 void dvr_entry_init(void);
 
 void dvr_entry_done(void);
-
-void dvr_entry_save(dvr_entry_t *de);
 
 void dvr_entry_destroy_by_config(dvr_config_t *cfg, int delconf);
 
@@ -520,7 +533,8 @@ dvr_entry_create_htsp( int enabled, const char *dvr_config_uuid,
                        const char *comment );
 
 dvr_entry_t *
-dvr_entry_update( dvr_entry_t *de, int enabled, channel_t *ch,
+dvr_entry_update( dvr_entry_t *de, int enabled,
+                  const char *dvr_config_uuid, channel_t *ch,
                   const char *title, const char *subtitle,
                   const char *desc, const char *lang,
                   time_t start, time_t stop,
@@ -554,11 +568,13 @@ dvr_entry_t *dvr_entry_find_by_event_fuzzy(epg_broadcast_t *e);
 
 const char *dvr_get_filename(dvr_entry_t *de);
 
-int64_t dvr_get_filesize(dvr_entry_t *de);
+int64_t dvr_get_filesize(dvr_entry_t *de, int flags);
 
 int64_t dvr_entry_claenup(dvr_entry_t *de, int64_t requiredBytes);
 
 void dvr_entry_set_rerecord(dvr_entry_t *de, int cmd);
+
+void dvr_entry_move(dvr_entry_t *de, int failed);
 
 dvr_entry_t *dvr_entry_stop(dvr_entry_t *de);
 
@@ -566,9 +582,11 @@ dvr_entry_t *dvr_entry_cancel(dvr_entry_t *de, int rerecord);
 
 void dvr_entry_dec_ref(dvr_entry_t *de);
 
-void dvr_entry_delete(dvr_entry_t *de, int no_missed_time_resched);
+int dvr_entry_delete(dvr_entry_t *de);
 
 void dvr_entry_cancel_delete(dvr_entry_t *de, int rerecord);
+
+int dvr_entry_file_moved(const char *src, const char *dst);
 
 void dvr_entry_destroy(dvr_entry_t *de, int delconf);
 
@@ -581,11 +599,16 @@ htsmsg_t *dvr_entry_class_removal_list ( void *o, const char *lang );
 
 int dvr_entry_verify(dvr_entry_t *de, access_t *a, int readonly);
 
-void dvr_spawn_postcmd(dvr_entry_t *de, const char *postcmd, const char *filename);
+void dvr_spawn_cmd(dvr_entry_t *de, const char *cmd, const char *filename, int pre);
 
+void dvr_vfs_refresh_entry(dvr_entry_t *de);
+void dvr_vfs_remove_entry(dvr_entry_t *de);
+int64_t dvr_vfs_update_filename(const char *filename, htsmsg_t *fdata);
+
+void dvr_disk_space_boot(void);
 void dvr_disk_space_init(void);
 void dvr_disk_space_done(void);
-int dvr_get_disk_space(int64_t *bfree, int64_t *btotal);
+int dvr_get_disk_space(int64_t *bfree, int64_t *bused, int64_t *btotal);
 
 /**
  *
@@ -614,8 +637,6 @@ dvr_autorec_add_series_link(const char *dvr_config_name,
                             epg_broadcast_t *event,
                             const char *owner, const char *creator,
                             const char *comment);
-
-void dvr_autorec_save(dvr_autorec_entry_t *dae);
 
 void dvr_autorec_changed(dvr_autorec_entry_t *dae, int purge);
 
@@ -668,7 +689,7 @@ int dvr_autorec_get_extra_time_post( dvr_autorec_entry_t *dae );
 
 int dvr_autorec_get_extra_time_pre( dvr_autorec_entry_t *dae );
 
-void dvr_autorec_completed( dvr_entry_t *de, int error_code );
+void dvr_autorec_completed( dvr_autorec_entry_t *dae, int error_code );
 
 uint32_t dvr_autorec_get_max_sched_count(dvr_autorec_entry_t *dae);
 
@@ -688,8 +709,6 @@ static inline dvr_timerec_entry_t *
 dvr_timerec_find_by_uuid(const char *uuid)
   { return (dvr_timerec_entry_t*)idnode_find(uuid, &dvr_timerec_entry_class, NULL); }
 
-
-void dvr_timerec_save(dvr_timerec_entry_t *dae);
 
 void dvr_timerec_check(dvr_timerec_entry_t *dae);
 

@@ -48,13 +48,12 @@ mpegts_service_class_get_mux ( void *ptr )
 static const void *
 mpegts_service_class_get_mux_uuid ( void *ptr )
 {
-  static char buf[UUID_HEX_SIZE], *s = buf;
   mpegts_service_t *ms = ptr;
   if (ms && ms->s_dvb_mux)
-    strcpy(buf, idnode_uuid_as_sstr(&ms->s_dvb_mux->mm_id) ?: "");
+    idnode_uuid_as_str(&ms->s_dvb_mux->mm_id, prop_sbuf);
   else
-    *buf = 0;
-  return &s;
+    prop_sbuf[0] = '\0';
+  return &prop_sbuf_ptr;
 }
 
 static const void *
@@ -81,17 +80,21 @@ mpegts_service_pref_capid_lock_list ( void *o, const char *lang )
    return strtab2htsmsg(tab, 1, lang);
 }
 
+CLASS_DOC(mpegts_service)
+
 const idclass_t mpegts_service_class =
 {
   .ic_super      = &service_class,
   .ic_class      = "mpegts_service",
-  .ic_caption    = N_("MPEG-TS service"),
+  .ic_caption    = N_("MPEG-TS Service"),
+  .ic_doc        = tvh_doc_mpegts_service_class,
   .ic_order      = "enabled,channel,svcname",
   .ic_properties = (const property_t[]){
     {
       .type     = PT_STR,
       .id       = "network",
       .name     = N_("Network"),
+      .desc     = N_("The network the service is on."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_service_class_get_network,
     },
@@ -99,6 +102,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_STR,
       .id       = "multiplex",
       .name     = N_("Mux"),
+      .desc     = N_("The mux the service is on."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_service_class_get_mux,
     },
@@ -106,6 +110,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_STR,
       .id       = "multiplex_uuid",
       .name     = N_("Mux UUID"),
+      .desc     = N_("The mux's universally unique identifier."),
       .opts     = PO_RDONLY | PO_NOSAVE | PO_HIDDEN | PO_EXPERT,
       .get      = mpegts_service_class_get_mux_uuid,
     },
@@ -113,6 +118,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_U16,
       .id       = "sid",
       .name     = N_("Service ID"),
+      .desc     = N_("The service ID as set by the provider."),
       .opts     = PO_RDONLY | PO_ADVANCED,
       .off      = offsetof(mpegts_service_t, s_dvb_service_id),
     },
@@ -120,6 +126,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_U16,
       .id       = "lcn",
       .name     = N_("Local channel number"),
+      .desc     = N_("The service's channel number as set by the provider."),
       .opts     = PO_RDONLY | PO_ADVANCED,
       .off      = offsetof(mpegts_service_t, s_dvb_channel_num),
     },
@@ -127,6 +134,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_U16,
       .id       = "lcn_minor",
       .name     = N_("Local channel minor"),
+      .desc     = N_("The service's channel minor as set by the provider."),
       .opts     = PO_RDONLY | PO_EXPERT,
       .off      = offsetof(mpegts_service_t, s_dvb_channel_minor),
     },
@@ -134,6 +142,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_U16,
       .id       = "lcn2",
       .name     = N_("OpenTV channel number"),
+      .desc     = N_("The OpenTV channel number as set by the provider."),
       .opts     = PO_RDONLY | PO_EXPERT,
       .off      = offsetof(mpegts_service_t, s_dvb_opentv_chnum),
     },
@@ -141,6 +150,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_U16,
       .id       = "srcid",
       .name     = N_("ATSC source ID"),
+      .desc     = N_("The ATSC source ID as set by the provider."),
       .opts     = PO_RDONLY | PO_EXPERT,
       .off      = offsetof(mpegts_service_t, s_atsc_source_id),
     },
@@ -148,6 +158,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_STR,
       .id       = "svcname",
       .name     = N_("Service name"),
+      .desc     = N_("The service name as set by the provider."),
       .opts     = PO_RDONLY,
       .off      = offsetof(mpegts_service_t, s_dvb_svcname),
     },
@@ -155,6 +166,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_STR,
       .id       = "provider",
       .name     = N_("Provider"),
+      .desc     = N_("The provider's name."),
       .opts     = PO_RDONLY | PO_HIDDEN,
       .off      = offsetof(mpegts_service_t, s_dvb_provider),
     },
@@ -162,6 +174,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_STR,
       .id       = "cridauth",
       .name     = N_("CRID authority"),
+      .desc     = N_("Content reference identifier authority."),
       .opts     = PO_RDONLY | PO_HIDDEN | PO_EXPERT,
       .off      = offsetof(mpegts_service_t, s_dvb_cridauth),
     },
@@ -169,6 +182,9 @@ const idclass_t mpegts_service_class =
       .type     = PT_U16,
       .id       = "dvb_servicetype",
       .name     = N_("Service type"),
+      .desc     = N_("The service type flag as defined by the DVB "
+                     "specifications (e.g. 0x02 = radio, 0x11 = MPEG2 "
+                     "HD TV, 0x19 = H.264 HD TV)"),
       .opts     = PO_RDONLY | PO_HIDDEN | PO_EXPERT,
       .off      = offsetof(mpegts_service_t, s_dvb_servicetype),
     },
@@ -176,6 +192,8 @@ const idclass_t mpegts_service_class =
       .type     = PT_BOOL,
       .id       = "dvb_ignore_eit",
       .name     = N_("Ignore EPG (EIT)"),
+      .desc     = N_("Enable or disable ignoring of Event Information "
+                     "Table (EIT) data on this mux."),
       .off      = offsetof(mpegts_service_t, s_dvb_ignore_eit),
       .opts     = PO_EXPERT,
     },
@@ -183,14 +201,17 @@ const idclass_t mpegts_service_class =
       .type     = PT_STR,
       .id       = "charset",
       .name     = N_("Character set"),
+      .desc     = N_("The character encoding for this service (e.g. UTF-8)."),
       .off      = offsetof(mpegts_service_t, s_dvb_charset),
       .list     = dvb_charset_enum,
-      .opts     = PO_EXPERT,
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
     },
     {
       .type     = PT_U16,
       .id       = "prefcapid",
       .name     = N_("Preferred CA PID"),
+      .desc     = N_("The Preferred Conditional Access Packet "
+                     "Identifier. Used for decrypting scrambled streams."),
       .off      = offsetof(mpegts_service_t, s_dvb_prefcapid),
       .opts     = PO_EXPERT,
     },
@@ -198,14 +219,18 @@ const idclass_t mpegts_service_class =
       .type     = PT_INT,
       .id       = "prefcapid_lock",
       .name     = N_("Lock preferred CA PID"),
+      .desc     = N_("The locking mechanism selection for The Preferred "
+                     "Conditional Access Packet Identifier. See Help "
+                     "for more information."),
       .off      = offsetof(mpegts_service_t, s_dvb_prefcapid_lock),
-      .opts     = PO_EXPERT,
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
       .list     = mpegts_service_pref_capid_lock_list,
     },
     {
       .type     = PT_U16,
       .id       = "force_caid",
       .name     = N_("Force CA ID (e.g. 0x2600)"),
+      .desc     = N_("Force usage of entered CA ID on this service."),
       .off      = offsetof(mpegts_service_t, s_dvb_forcecaid),
       .opts     = PO_EXPERT | PO_HEXA,
     },
@@ -213,6 +238,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_TIME,
       .id       = "created",
       .name     = N_("Created"),
+      .desc     = N_("When the service was first identified and recorded."),
       .off      = offsetof(mpegts_service_t, s_dvb_created),
       .opts     = PO_ADVANCED | PO_RDONLY,
     },
@@ -220,6 +246,7 @@ const idclass_t mpegts_service_class =
       .type     = PT_TIME,
       .id       = "last_seen",
       .name     = N_("Last seen"),
+      .desc     = N_("When the service was last seen during a mux scan."),
       .off      = offsetof(mpegts_service_t, s_dvb_last_seen),
       .opts     = PO_ADVANCED | PO_RDONLY,
     },
@@ -245,27 +272,21 @@ mpegts_service_is_enabled(service_t *t, int flags)
 /*
  * Save
  */
-static void
-mpegts_service_config_save ( service_t *t )
+static htsmsg_t *
+mpegts_service_config_save ( service_t *t, char *filename, size_t fsize )
 {
-  htsmsg_t *c = htsmsg_create_map();
   mpegts_service_t *s = (mpegts_service_t*)t;
-  char ubuf1[UUID_HEX_SIZE];
-  char ubuf2[UUID_HEX_SIZE];
-  service_save(t, c);
-  hts_settings_save(c, "input/dvb/networks/%s/muxes/%s/services/%s",
-                    idnode_uuid_as_sstr(&s->s_dvb_mux->mm_network->mn_id),
-                    idnode_uuid_as_str(&s->s_dvb_mux->mm_id, ubuf1),
-                    idnode_uuid_as_str(&s->s_id, ubuf2));
-  htsmsg_destroy(c);
+  idnode_changed(&s->s_dvb_mux->mm_id);
+  return NULL;
 }
 
 /*
  * Service instance list
  */
-static void
-mpegts_service_enlist(service_t *t, tvh_input_t *ti,
-                      struct service_instance_list *sil, int flags)
+static int
+mpegts_service_enlist_raw
+  ( service_t *t, tvh_input_t *ti, struct service_instance_list *sil,
+    int flags, int weight )
 {
   int p = 0, w;
   mpegts_service_t      *s = (mpegts_service_t*)t;
@@ -288,21 +309,39 @@ mpegts_service_enlist(service_t *t, tvh_input_t *ti,
     if (ti && (tvh_input_t *)mi != ti)
       continue;
 
-    if (!mi->mi_is_enabled(mi, mmi->mmi_mux, flags)) continue;
+    if (!mi->mi_is_enabled(mi, mmi->mmi_mux, flags, weight)) continue;
 
     /* Set weight to -1 (forced) for already active mux */
     if (mmi->mmi_mux->mm_active == mmi) {
       w = -1;
       p = -1;
     } else {
-      w = mi->mi_get_weight(mi, mmi->mmi_mux, flags);
+      w = mi->mi_get_weight(mi, mmi->mmi_mux, flags, weight);
       p = mi->mi_get_priority(mi, mmi->mmi_mux, flags);
-      if (w > 0 && mi->mi_free_weight && w < mi->mi_free_weight)
+      if (w > 0 && mi->mi_free_weight &&
+          weight >= mi->mi_free_weight && w < mi->mi_free_weight)
         w = 0;
     }
 
     service_instance_add(sil, t, mi->mi_instance, mi->mi_name, p, w);
   }
+
+  return 0;
+}
+
+/*
+ * Service instance list
+ */
+static int
+mpegts_service_enlist
+  ( service_t *t, tvh_input_t *ti, struct service_instance_list *sil,
+    int flags, int weight )
+{
+  /* invalid PMT */
+  if (t->s_pmt_pid <= 0 || t->s_pmt_pid >= 8191)
+    return SM_CODE_INVALID_SERVICE;
+
+  return mpegts_service_enlist_raw(t, ti, sil, flags, weight);
 }
 
 /*
@@ -402,14 +441,20 @@ mpegts_service_setsourceinfo(service_t *t, source_info_t *si)
   memset(si, 0, sizeof(struct source_info));
   si->si_type = S_MPEG_TS;
 
+  uuid_copy(&si->si_network_uuid, &m->mm_network->mn_id.in_uuid);
+  uuid_copy(&si->si_mux_uuid, &m->mm_id.in_uuid);
+
   if(m->mm_network->mn_network_name != NULL)
     si->si_network = strdup(m->mm_network->mn_network_name);
+  mpegts_network_get_type_str(m->mm_network, buf, sizeof(buf));
+  si->si_network_type = strdup(buf);
 
   m->mm_display_name(m, buf, sizeof(buf));
   si->si_mux = strdup(buf);
 
   if(s->s_dvb_active_input) {
     mpegts_input_t *mi = s->s_dvb_active_input;
+    uuid_copy(&si->si_adapter_uuid, &mi->ti_id.in_uuid);
     mi->mi_display_name(mi, buf, sizeof(buf));
     si->si_adapter = strdup(buf);
   }
@@ -522,12 +567,13 @@ mpegts_service_channel_icon ( service_t *s )
                   (mmd->lm_tuning.u.dmc_fe_qpsk.orbital_pos == DVB_POLARISATION_HORIZONTAL ? 0x8000 : 0);
         break;
       case DVB_TYPE_C:
+      case DVB_TYPE_ATSC_C:
         hash = 0xFFFF0000;
         break;
       case DVB_TYPE_T:
         hash = 0xEEEE0000;
         break;
-      case DVB_TYPE_ATSC:
+      case DVB_TYPE_ATSC_T:
         hash = 0xDDDD0000;
         break;
       default:
@@ -536,7 +582,7 @@ mpegts_service_channel_icon ( service_t *s )
 
     snprintf(prop_sbuf, PROP_SBUF_LEN,
              "picon://1_0_%X_%X_%X_%X_%X_0_0_0.png",
-             ms->s_dvb_servicetype,
+             config.picon_scheme == PICON_ISVCTYPE ? 1 : ms->s_dvb_servicetype,
              ms->s_dvb_service_id,
              ms->s_dvb_mux->mm_tsid,
              ms->s_dvb_mux->mm_onid,
@@ -623,32 +669,36 @@ mpegts_service_mapped ( service_t *t )
 }
 
 void
-mpegts_service_delete ( service_t *t, int delconf )
+mpegts_service_unref ( service_t *t )
 {
   mpegts_service_t *ms = (mpegts_service_t*)t;
-  mpegts_mux_t     *mm = ms->s_dvb_mux;
-  char ubuf1[UUID_HEX_SIZE];
-  char ubuf2[UUID_HEX_SIZE];
 
-  /* Remove config */
-  if (delconf && t->s_type == STYPE_STD)
-    hts_settings_remove("input/dvb/networks/%s/muxes/%s/services/%s",
-                      idnode_uuid_as_sstr(&mm->mm_network->mn_id),
-                      idnode_uuid_as_str(&mm->mm_id, ubuf1),
-                      idnode_uuid_as_str(&t->s_id, ubuf2));
-
-  /* Free memory */
   free(ms->s_dvb_svcname);
   free(ms->s_dvb_provider);
   free(ms->s_dvb_cridauth);
   free(ms->s_dvb_charset);
+}
+
+void
+mpegts_service_delete ( service_t *t, int delconf )
+{
+  mpegts_service_t *ms = (mpegts_service_t*)t, *mms;
+  mpegts_mux_t     *mm = t->s_type == STYPE_STD ? ms->s_dvb_mux : NULL;
+
+  if (mm)
+    idnode_changed(&mm->mm_id);
+
+  /* Free memory */
   if (t->s_type == STYPE_STD)
     LIST_REMOVE(ms, s_dvb_mux_link);
   sbuf_free(&ms->s_tsbuf);
 
   /* Remove master/slave linking */
-  LIST_SAFE_REMOVE(ms, s_masters_link);
-  LIST_SAFE_REMOVE(ms, s_slaves_link);
+  while (ms->s_masters.is_count > 0) {
+    mms = (mpegts_service_t *)ms->s_masters.is_array[0];
+    mms->s_unlink(mms, ms);
+  }
+  idnode_set_clear(&ms->s_masters);
 
   /* Remove PID lists */
   mpegts_pid_destroy(&ms->s_pids);
@@ -666,6 +716,18 @@ mpegts_service_satip_source ( service_t *t )
   return mn ? mn->mn_satip_source : -1;
 }
 
+static void
+mpegts_service_memoryinfo ( service_t *t, int64_t *size )
+{
+  mpegts_service_t *ms = (mpegts_service_t*)t;
+  *size += sizeof(*ms);
+  *size += tvh_strlen(ms->s_nicename);
+  *size += tvh_strlen(ms->s_dvb_svcname);
+  *size += tvh_strlen(ms->s_dvb_provider);
+  *size += tvh_strlen(ms->s_dvb_cridauth);
+  *size += tvh_strlen(ms->s_dvb_charset);
+}
+
 /* **************************************************************************
  * Creation/Location
  * *************************************************************************/
@@ -680,6 +742,7 @@ mpegts_service_create0
 {
   int r;
   char buf[256];
+  time_t dispatch_clock = gclk();
 
   /* defaults for older version */
   s->s_dvb_created = dispatch_clock;
@@ -694,8 +757,8 @@ mpegts_service_create0
     if (sid)     s->s_dvb_service_id = sid;
     if (pmt_pid) s->s_pmt_pid        = pmt_pid;
   } else {
-    if (s->s_dvb_last_seen > dispatch_clock) /* sanity check */
-      s->s_dvb_last_seen = dispatch_clock;
+    if (s->s_dvb_last_seen > gclk()) /* sanity check */
+      s->s_dvb_last_seen = gclk();
   }
   s->s_dvb_mux        = mm;
   if ((r = dvb_servicetype_lookup(s->s_dvb_servicetype)) != -1)
@@ -703,6 +766,7 @@ mpegts_service_create0
   LIST_INSERT_HEAD(&mm->mm_services, s, s_dvb_mux_link);
   
   s->s_delete         = mpegts_service_delete;
+  s->s_unref          = mpegts_service_unref;
   s->s_is_enabled     = mpegts_service_is_enabled;
   s->s_config_save    = mpegts_service_config_save;
   s->s_enlist         = mpegts_service_enlist;
@@ -717,6 +781,7 @@ mpegts_service_create0
   s->s_channel_icon   = mpegts_service_channel_icon;
   s->s_mapped         = mpegts_service_mapped;
   s->s_satip_source   = mpegts_service_satip_source;
+  s->s_memoryinfo     = mpegts_service_memoryinfo;
 
   pthread_mutex_lock(&s->s_stream_mutex);
   service_make_nicename((service_t*)s);
@@ -757,8 +822,8 @@ mpegts_service_find
         if (save) *save = 1;
       }
       if (create) {
-        if ((save && *save) || s->s_dvb_last_seen + 3600 < dispatch_clock) {
-          s->s_dvb_last_seen = dispatch_clock;
+        if ((save && *save) || s->s_dvb_last_seen + 3600 < gclk()) {
+          s->s_dvb_last_seen = gclk();
           if (save) *save = 1;
         }
       }
@@ -769,7 +834,7 @@ mpegts_service_find
   /* Create */
   if (create) {
     s = mm->mm_network->mn_create_service(mm, sid, pmt_pid);
-    s->s_dvb_created = s->s_dvb_last_seen = dispatch_clock;
+    s->s_dvb_created = s->s_dvb_last_seen = gclk();
     if (save) *save = 1;
   }
 
@@ -849,12 +914,12 @@ mpegts_service_raw_update_pids(mpegts_service_t *t, mpegts_apids_t *pids)
       mpegts_input_close_pids(mi, mm, t, 1);
       for (i = 0; i < x->count; i++) {
         pi = &x->pids[i];
-        mpegts_input_open_pid(mi, mm, pi->pid, MPS_RAW, pi->weight, t);
+        mpegts_input_open_pid(mi, mm, pi->pid, MPS_RAW, pi->weight, t, 0);
       }
     } else {
       if (pids->all) {
         mpegts_input_close_pids(mi, mm, t, 1);
-        mpegts_input_open_pid(mi, mm, MPEGTS_FULLMUX_PID, MPS_RAW, MPS_WEIGHT_RAW, t);
+        mpegts_input_open_pid(mi, mm, MPEGTS_FULLMUX_PID, MPS_RAW, MPS_WEIGHT_RAW, t, 0);
       } else {
         mpegts_pid_compare(p, x, &add, &del);
         for (i = 0; i < del.count; i++) {
@@ -863,7 +928,7 @@ mpegts_service_raw_update_pids(mpegts_service_t *t, mpegts_apids_t *pids)
         }
         for (i = 0; i < add.count; i++) {
           pi = &add.pids[i];
-          mpegts_input_open_pid(mi, mm, pi->pid, MPS_RAW, pi->weight, t);
+          mpegts_input_open_pid(mi, mm, pi->pid, MPS_RAW, pi->weight, t, 0);
         }
         mpegts_pid_done(&add);
         mpegts_pid_done(&del);
@@ -885,23 +950,68 @@ mpegts_service_raw_update_pids(mpegts_service_t *t, mpegts_apids_t *pids)
   return 0;
 }
 
+void
+mpegts_service_update_slave_pids ( mpegts_service_t *s, int del )
+{
+  mpegts_service_t *s2;
+  mpegts_apids_t *pids;
+  elementary_stream_t *st;
+  int i;
+
+  lock_assert(&s->s_stream_mutex);
+
+  pids = mpegts_pid_alloc();
+
+  mpegts_pid_add(pids, s->s_pmt_pid, MPS_WEIGHT_PMT);
+  mpegts_pid_add(pids, s->s_pcr_pid, MPS_WEIGHT_PCR);
+
+  /* Ensure that filtered PIDs are not send in ts_recv_raw */
+  TAILQ_FOREACH(st, &s->s_filt_components, es_filt_link)
+    if ((s->s_scrambled_pass || st->es_type != SCT_CA) &&
+        st->es_pid >= 0 && st->es_pid < 8192)
+      mpegts_pid_add(pids, st->es_pid, mpegts_mps_weight(st));
+
+  for (i = 0; i < s->s_masters.is_count; i++) {
+    s2 = (mpegts_service_t *)s->s_masters.is_array[i];
+    pthread_mutex_lock(&s2->s_stream_mutex);
+    if (!del)
+      mpegts_pid_add_group(s2->s_slaves_pids, pids);
+    else
+      mpegts_pid_del_group(s2->s_slaves_pids, pids);
+    pthread_mutex_unlock(&s2->s_stream_mutex);
+  }
+
+  mpegts_pid_destroy(&pids);
+}
+
 static int
 mpegts_service_link ( mpegts_service_t *master, mpegts_service_t *slave )
 {
+  pthread_mutex_lock(&slave->s_stream_mutex);
   pthread_mutex_lock(&master->s_stream_mutex);
-  LIST_INSERT_HEAD(&slave->s_masters, master, s_masters_link);
+  assert(!idnode_set_exists(&slave->s_masters, &master->s_id));
+  assert(LIST_SAFE_ENTRY(slave, s_slaves_link));
+  idnode_set_alloc(&slave->s_masters, 16);
+  idnode_set_add(&slave->s_masters, &master->s_id, NULL, NULL);
   LIST_INSERT_HEAD(&master->s_slaves, slave, s_slaves_link);
   pthread_mutex_unlock(&master->s_stream_mutex);
+  mpegts_service_update_slave_pids(slave, 0);
+  pthread_mutex_unlock(&slave->s_stream_mutex);
   return 0;
 }
 
 static int
 mpegts_service_unlink ( mpegts_service_t *master, mpegts_service_t *slave )
 {
+  pthread_mutex_lock(&slave->s_stream_mutex);
+  mpegts_service_update_slave_pids(slave, 1);
   pthread_mutex_lock(&master->s_stream_mutex);
-  LIST_SAFE_REMOVE(master, s_masters_link);
+  idnode_set_remove(&slave->s_masters, &master->s_id);
+  if (slave->s_masters.is_count == 0)
+    idnode_set_clear(&slave->s_masters);
   LIST_SAFE_REMOVE(slave, s_slaves_link);
   pthread_mutex_unlock(&master->s_stream_mutex);
+  pthread_mutex_unlock(&slave->s_stream_mutex);
   return 0;
 }
 
@@ -927,7 +1037,7 @@ mpegts_service_create_raw ( mpegts_mux_t *mm )
   s->s_delete         = mpegts_service_delete;
   s->s_is_enabled     = mpegts_service_is_enabled;
   s->s_config_save    = mpegts_service_config_save;
-  s->s_enlist         = mpegts_service_enlist;
+  s->s_enlist         = mpegts_service_enlist_raw;
   s->s_start_feed     = mpegts_service_start;
   s->s_stop_feed      = mpegts_service_stop;
   s->s_refresh_feed   = mpegts_service_refresh;
@@ -942,6 +1052,7 @@ mpegts_service_create_raw ( mpegts_mux_t *mm )
   s->s_link           = mpegts_service_link;
   s->s_unlink         = mpegts_service_unlink;
   s->s_satip_source   = mpegts_service_satip_source;
+  s->s_memoryinfo     = mpegts_service_memoryinfo;
 
   pthread_mutex_lock(&s->s_stream_mutex);
   free(s->s_nicename);

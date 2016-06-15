@@ -84,11 +84,12 @@ static const char *epggrab_mod_class_title(idnode_t *self, const char *lang)
   return prop_sbuf;
 }
 
-static void epggrab_mod_class_save(idnode_t *self)
+static void
+epggrab_mod_class_changed(idnode_t *self)
 {
   epggrab_module_t *mod = (epggrab_module_t *)self;
   epggrab_activate_module(mod, mod->enabled);
-  epggrab_save();
+  idnode_changed(&epggrab_conf.idnode);
 }
 
 static const void *epggrab_mod_class_type_get(void *o)
@@ -103,13 +104,16 @@ static int epggrab_mod_class_type_set(void *o, const void *v)
   return 0;
 }
 
+CLASS_DOC(epggrabber_modules)
+
 const idclass_t epggrab_mod_class = {
   .ic_class      = "epggrab_mod",
-  .ic_caption    = N_("EPG grabber"),
+  .ic_caption    = N_("EPG Grabber"),
+  .ic_doc        = tvh_doc_epggrabber_modules_class,
   .ic_event      = "epggrab_mod",
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_get_title  = epggrab_mod_class_title,
-  .ic_save       = epggrab_mod_class_save,
+  .ic_changed    = epggrab_mod_class_changed,
   .ic_groups     = (const property_group_t[]) {
      {
         .name   = N_("Settings"),
@@ -122,6 +126,7 @@ const idclass_t epggrab_mod_class = {
       .type   = PT_STR,
       .id     = "name",
       .name   = N_("Name"),
+      .desc   = N_("The EPG grabber name."),
       .off    = offsetof(epggrab_module_t, name),
       .opts   = PO_RDONLY,
       .group  = 1,
@@ -130,6 +135,7 @@ const idclass_t epggrab_mod_class = {
       .type   = PT_STR,
       .id     = "type",
       .name   = N_("Type"),
+      .desc   = N_("The EPG grabber type."),
       .get    = epggrab_mod_class_type_get,
       .set    = epggrab_mod_class_type_set,
       .opts   = PO_RDONLY | PO_LOCALE,
@@ -139,6 +145,7 @@ const idclass_t epggrab_mod_class = {
       .type   = PT_BOOL,
       .id     = "enabled",
       .name   = N_("Enabled"),
+      .desc   = N_("Enable/disable the grabber."),
       .off    = offsetof(epggrab_module_t, enabled),
       .group  = 1,
     },
@@ -146,6 +153,10 @@ const idclass_t epggrab_mod_class = {
       .type   = PT_INT,
       .id     = "priority",
       .name   = N_("Priority"),
+      .desc   = N_("Grabber priority. This option lets you pick which "
+                   "EPG grabber's data gets used first if more than one "
+                   "grabber is enabled. Priority is given to the grabber "
+                   "with the highest value set here."),
       .off    = offsetof(epggrab_module_t, priority),
       .opts   = PO_ADVANCED,
       .group  = 1
@@ -154,7 +165,7 @@ const idclass_t epggrab_mod_class = {
   }
 };
 
-const idclass_t epggrab_class_mod_int = {
+const idclass_t epggrab_mod_int_class = {
   .ic_super      = &epggrab_mod_class,
   .ic_class      = "epggrab_mod_int",
   .ic_caption    = N_("Internal EPG grabber"),
@@ -163,6 +174,7 @@ const idclass_t epggrab_class_mod_int = {
       .type   = PT_STR,
       .id     = "path",
       .name   = N_("Path"),
+      .desc   = N_("Path to the grabber executable."),
       .off    = offsetof(epggrab_module_int_t, path),
       .opts   = PO_RDONLY | PO_NOSAVE,
       .group  = 1
@@ -171,6 +183,7 @@ const idclass_t epggrab_class_mod_int = {
       .type   = PT_STR,
       .id     = "args",
       .name   = N_("Extra arguments"),
+      .desc   = N_("Additional arguments to pass to the grabber."),
       .off    = offsetof(epggrab_module_int_t, args),
       .opts   = PO_ADVANCED,
       .group  = 1
@@ -179,7 +192,7 @@ const idclass_t epggrab_class_mod_int = {
   }
 };
 
-const idclass_t epggrab_class_mod_ext = {
+const idclass_t epggrab_mod_ext_class = {
   .ic_super      = &epggrab_mod_class,
   .ic_class      = "epggrab_mod_ext",
   .ic_caption    = N_("External EPG grabber"),
@@ -188,6 +201,7 @@ const idclass_t epggrab_class_mod_ext = {
       .type   = PT_STR,
       .id     = "path",
       .name   = N_("Path"),
+      .desc   = N_("Path to the socket Tvheadend will read data from."),
       .off    = offsetof(epggrab_module_ext_t, path),
       .opts   = PO_RDONLY | PO_NOSAVE,
       .group  = 1
@@ -196,7 +210,7 @@ const idclass_t epggrab_class_mod_ext = {
   }
 };
 
-const idclass_t epggrab_class_mod_ota = {
+const idclass_t epggrab_mod_ota_class = {
   .ic_super      = &epggrab_mod_class,
   .ic_class      = "epggrab_mod_ota",
   .ic_caption    = N_("Over-the-air EPG grabber"),
@@ -238,20 +252,20 @@ epggrab_module_t *epggrab_module_create
  */
 void epggrab_module_parse( void *m, htsmsg_t *data )
 {
-  time_t tm1, tm2;
+  int64_t tm1, tm2;
   int save = 0;
   epggrab_stats_t stats;
   epggrab_module_int_t *mod = m;
 
   /* Parse */
   memset(&stats, 0, sizeof(stats));
-  time(&tm1);
+  tm1 = getfastmonoclock();
   save |= mod->parse(mod, data, &stats);
-  time(&tm2);
+  tm2 = getfastmonoclock();
   htsmsg_destroy(data);
 
   /* Debug stats */
-  tvhlog(LOG_INFO, mod->id, "parse took %"PRItime_t" seconds", tm2 - tm1);
+  tvhlog(LOG_INFO, mod->id, "parse took %"PRId64" seconds", mono2sec(tm2 - tm1));
   tvhlog(LOG_INFO, mod->id, "  channels   tot=%5d new=%5d mod=%5d",
          stats.channels.total, stats.channels.created,
          stats.channels.modified);
@@ -320,10 +334,10 @@ epggrab_module_int_t *epggrab_module_int_create
 {
   /* Allocate data */
   if (!skel) skel = calloc(1, sizeof(epggrab_module_int_t));
-  
+
   /* Pass through */
   epggrab_module_create((epggrab_module_t*)skel,
-                        cls ?: &epggrab_class_mod_int,
+                        cls ?: &epggrab_mod_int_class,
                         id, saveid, name, priority);
 
   /* Int data */
@@ -339,7 +353,7 @@ epggrab_module_int_t *epggrab_module_int_create
 }
 
 char *epggrab_module_grab_spawn ( void *m )
-{ 
+{
   int        rd = -1, outlen;
   char       *outbuf;
   epggrab_module_int_t *mod = m;
@@ -445,13 +459,14 @@ static void *_epggrab_socket_thread ( void *p )
   int s;
   epggrab_module_ext_t *mod = (epggrab_module_ext_t*)p;
   tvhlog(LOG_INFO, mod->id, "external socket enabled");
-  
+
   while ( mod->enabled && mod->sock ) {
     tvhlog(LOG_DEBUG, mod->id, "waiting for connection");
     s = accept(mod->sock, NULL, NULL);
     if (s <= 0) continue;
     tvhlog(LOG_DEBUG, mod->id, "got connection %d", s);
     _epggrab_socket_handler(mod, s);
+    close(s);
   }
   tvhlog(LOG_DEBUG, mod->id, "terminated");
   return NULL;
@@ -540,7 +555,7 @@ epggrab_module_activate_socket ( void *m, int a )
  * Create a module
  */
 epggrab_module_ext_t *epggrab_module_ext_create
-  ( epggrab_module_ext_t *skel,
+  ( epggrab_module_ext_t *skel, const idclass_t *cls,
     const char *id, const char *saveid,
     const char *name, int priority, const char *sockid,
     int (*parse) (void *m, htsmsg_t *data, epggrab_stats_t *sta),
@@ -550,11 +565,11 @@ epggrab_module_ext_t *epggrab_module_ext_create
 
   /* Allocate data */
   if (!skel) skel = calloc(1, sizeof(epggrab_module_ext_t));
-  
+
   /* Pass through */
   hts_settings_buildpath(path, sizeof(path), "epggrab/%s.sock", sockid);
   epggrab_module_int_create((epggrab_module_int_t*)skel,
-                            &epggrab_class_mod_ext,
+                            cls ?: &epggrab_mod_ext_class,
                             id, saveid, name, priority, path,
                             NULL, parse, trans);
 
@@ -577,10 +592,10 @@ epggrab_module_ota_t *epggrab_module_ota_create
     epggrab_ota_module_ops_t *ops )
 {
   if (!skel) skel = calloc(1, sizeof(epggrab_module_ota_t));
-  
+
   /* Pass through */
   epggrab_module_create((epggrab_module_t*)skel,
-                        &epggrab_class_mod_ota,
+                        &epggrab_mod_ota_class,
                         id, saveid, name, priority);
 
   /* Setup */

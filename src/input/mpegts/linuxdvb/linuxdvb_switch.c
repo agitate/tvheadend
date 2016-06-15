@@ -109,11 +109,14 @@ linuxdvb_switch_class_get_title ( idnode_t *o, const char *lang )
 
 extern const idclass_t linuxdvb_diseqc_class;
 
+CLASS_DOC(linuxdvb_satconf)
+
 const idclass_t linuxdvb_switch_class =
 {
   .ic_super       = &linuxdvb_diseqc_class,
   .ic_class       = "linuxdvb_switch",
-  .ic_caption     = N_("DiseqC switch"),
+  .ic_caption     = N_("TV Adapters - SatConfig - DiseqC Switch"),
+  .ic_doc         = tvh_doc_linuxdvb_satconf_class,
   .ic_get_title   = linuxdvb_switch_class_get_title,
   .ic_properties  = (const property_t[]) {
     {
@@ -196,14 +199,14 @@ linuxdvb_switch_tune
           if (linuxdvb_diseqc_send(fd, 0xE0 | r2, 0x10, 0x39, 1,
                                    0xF0 | ls->ls_uncommitted))
             return -1;
-          usleep(slp);
+          tvh_safe_usleep(slp);
         }
 
       /* Committed */
       if (ls->ls_committed >= 0) {
         if (linuxdvb_diseqc_send(fd, 0xE0 | r1, 0x10, 0x38, 1, com))
           return -1;
-        usleep(slp);
+        tvh_safe_usleep(slp);
       }
 
       if (!ls->ls_uncommitted_first) {
@@ -212,7 +215,7 @@ linuxdvb_switch_tune
           if (linuxdvb_diseqc_send(fd, 0xE0 | r2, 0x10, 0x39, 1,
                                    0xF0 | ls->ls_uncommitted))
             return -1;
-          usleep(slp);
+          tvh_safe_usleep(slp);
         }
       }
 

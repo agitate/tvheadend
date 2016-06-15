@@ -430,6 +430,9 @@ atsc_get_string
       src    += 3;
       srclen -= 3;
 
+      if (bytecount > srclen)
+        return ls;
+
       if (mode == 0 && compressiontype == 0) {
         tvhtrace("atsc-str", "    %d: comptype 0x%02x, mode 0x%02x, %d bytes: '%.*s'",
                  j, compressiontype, mode, bytecount, bytecount, src);
@@ -452,11 +455,59 @@ atsc_get_string
 }
 
 /*
+ *
+ */
+
+static struct strtab dvb_timezone_strtab[] = {
+  { N_("UTC"),        0 },
+  { N_("Local (server) time"), 1 },
+  { N_("UTC- 1"),    -1*60 },
+  { N_("UTC- 2"),    -2*60 },
+  { N_("UTC- 2:30"), -2*60-30 },
+  { N_("UTC- 3"),    -3*60 },
+  { N_("UTC- 3:30"), -3*60-30 },
+  { N_("UTC- 4"),    -4*60 },
+  { N_("UTC- 4:30"), -4*60-30 },
+  { N_("UTC- 5"),    -5*60 },
+  { N_("UTC- 6"),    -6*60 },
+  { N_("UTC- 7"),    -7*60 },
+  { N_("UTC- 8"),    -8*60 },
+  { N_("UTC- 9"),    -9*60 },
+  { N_("UTC- 9:30"), -9*60-30 },
+  { N_("UTC-10"),    -10*60 },
+  { N_("UTC-11"),    -11*60 },
+  { N_("UTC+ 1"),     1*60 },
+  { N_("UTC+ 2"),     2*60 },
+  { N_("UTC+ 3"),     3*60 },
+  { N_("UTC+ 4"),     4*60 },
+  { N_("UTC+ 4:30"),  4*60+30 },
+  { N_("UTC+ 5"),     5*60 },
+  { N_("UTC+ 5:30"),  5*60+30 },
+  { N_("UTC+ 5:45"),  5*60+45 },
+  { N_("UTC+ 6"),     6*60 },
+  { N_("UTC+ 6:30"),  6*60+30 },
+  { N_("UTC+ 7"),     7*60 },
+  { N_("UTC+ 8"),     8*60 },
+  { N_("UTC+ 8:45"),  8*60+45 },
+  { N_("UTC+ 9"),     9*60 },
+  { N_("UTC+ 9:30"),  9*60+30 },
+  { N_("UTC+10"),     10*60 },
+  { N_("UTC+10:30"),  10*60+30 },
+  { N_("UTC+11"),     11*60 },
+};
+
+htsmsg_t *
+dvb_timezone_enum ( void *p, const char *lang )
+{
+  return strtab2htsmsg(dvb_timezone_strtab, 1, lang);
+}
+
+/*
  * DVB time and date functions
  */
 
 time_t
-dvb_convert_date(const uint8_t *dvb_buf, int local)
+dvb_convert_date(const uint8_t *dvb_buf, int tmzone)
 {
   int i;
   int year, month, day, hour, min, sec;
@@ -492,7 +543,14 @@ dvb_convert_date(const uint8_t *dvb_buf, int local)
   dvb_time.tm_isdst = -1;
   dvb_time.tm_wday = 0;
   dvb_time.tm_yday = 0;
-  return local ? mktime(&dvb_time) : timegm(&dvb_time);
+
+  if (tmzone == 0) /* UTC */
+    return timegm(&dvb_time);
+  if (tmzone == 1) /* Local time */
+    return mktime(&dvb_time);
+
+  /* apply offset */
+  return timegm(&dvb_time) - tmzone * 60;
 }
 
 static time_t _gps_leap_seconds[17] = {
@@ -598,22 +656,35 @@ int dvb_str2rolloff(const char *p)
 
 const static struct strtab delsystab[] = {
   { "NONE",         DVB_SYS_NONE },
+  { "DVB-C",        DVB_SYS_DVBC_ANNEX_A },
   { "DVBC/ANNEX_A", DVB_SYS_DVBC_ANNEX_A },
   { "DVBC_ANNEX_A", DVB_SYS_DVBC_ANNEX_A },
+  { "ATSC-C",       DVB_SYS_DVBC_ANNEX_B },
   { "DVBC/ANNEX_B", DVB_SYS_DVBC_ANNEX_B },
   { "DVBC_ANNEX_B", DVB_SYS_DVBC_ANNEX_B },
+  { "DVB-C/ANNEX-C",DVB_SYS_DVBC_ANNEX_C },
   { "DVBC/ANNEX_C", DVB_SYS_DVBC_ANNEX_C },
   { "DVBC_ANNEX_C", DVB_SYS_DVBC_ANNEX_C },
   { "DVBC_ANNEX_AC",DVB_SYS_DVBC_ANNEX_A }, /* for compatibility */
+  { "DVB-T",        DVB_SYS_DVBT },
   { "DVBT",         DVB_SYS_DVBT },
+  { "DVB-T2",       DVB_SYS_DVBT2 },
   { "DVBT2",        DVB_SYS_DVBT2 },
+  { "DVB-S",        DVB_SYS_DVBS },
   { "DVBS",         DVB_SYS_DVBS },
+  { "DVB-S2",       DVB_SYS_DVBS2 },
   { "DVBS2",        DVB_SYS_DVBS2 },
+  { "DVB-H",        DVB_SYS_DVBH },
   { "DVBH",         DVB_SYS_DVBH },
+  { "ISDB-T",       DVB_SYS_ISDBT },
   { "ISDBT",        DVB_SYS_ISDBT },
+  { "ISDB-S",       DVB_SYS_ISDBS },
   { "ISDBS",        DVB_SYS_ISDBS },
+  { "ISDB-C",       DVB_SYS_ISDBC },
   { "ISDBC",        DVB_SYS_ISDBC },
+  { "ATSC-T",       DVB_SYS_ATSC },
   { "ATSC",         DVB_SYS_ATSC },
+  { "ATSCM-H",      DVB_SYS_ATSCMH },
   { "ATSCMH",       DVB_SYS_ATSCMH },
   { "DTMB",         DVB_SYS_DTMB },
   { "DMBTH",        DVB_SYS_DTMB },	/* for compatibility */
@@ -629,22 +700,28 @@ dvb_delsys2type ( dvb_fe_delivery_system_t delsys )
 {
   switch (delsys) {
     case DVB_SYS_DVBC_ANNEX_A:
-    case DVB_SYS_DVBC_ANNEX_B:
     case DVB_SYS_DVBC_ANNEX_C:
-    case DVB_SYS_ISDBC:
       return DVB_TYPE_C;
     case DVB_SYS_DVBT:
     case DVB_SYS_DVBT2:
     case DVB_SYS_TURBO:
-    case DVB_SYS_ISDBT:
       return DVB_TYPE_T;
     case DVB_SYS_DVBS:
     case DVB_SYS_DVBS2:
-    case DVB_SYS_ISDBS:
       return DVB_TYPE_S;
     case DVB_SYS_ATSC:
     case DVB_SYS_ATSCMH:
-      return DVB_TYPE_ATSC;
+      return DVB_TYPE_ATSC_T;
+    case DVB_SYS_DVBC_ANNEX_B:
+      return DVB_TYPE_ATSC_C;
+    case DVB_SYS_ISDBT:
+      return DVB_TYPE_ISDB_T;
+    case DVB_SYS_ISDBC:
+      return DVB_TYPE_ISDB_C;
+    case DVB_SYS_ISDBS:
+      return DVB_TYPE_ISDB_S;
+    case DVB_SYS_DAB:
+      return DVB_TYPE_DAB;
     default:
       return DVB_TYPE_NONE;
   }
@@ -841,10 +918,24 @@ const static struct strtab poltab[] = {
 dvb_str2val(pol);
 
 const static struct strtab typetab[] = {
-  {"DVB-T", DVB_TYPE_T},
-  {"DVB-C", DVB_TYPE_C},
-  {"DVB-S", DVB_TYPE_S},
-  {"ATSC",  DVB_TYPE_ATSC},
+  {"DVB-T",  DVB_TYPE_T},
+  {"DVB-C",  DVB_TYPE_C},
+  {"DVB-S",  DVB_TYPE_S},
+  {"ATSC-T", DVB_TYPE_ATSC_T},
+  {"ATSC-C", DVB_TYPE_ATSC_C},
+  {"ISDB-T", DVB_TYPE_ISDB_T},
+  {"ISDB-C", DVB_TYPE_ISDB_C},
+  {"ISDB-S", DVB_TYPE_ISDB_S},
+  {"DAB",    DVB_TYPE_DAB},
+  {"DVBT",   DVB_TYPE_T},
+  {"DVBC",   DVB_TYPE_C},
+  {"DVBS",   DVB_TYPE_S},
+  {"ATSC",   DVB_TYPE_ATSC_T},
+  {"ATSCT",  DVB_TYPE_ATSC_T},
+  {"ATSCC",  DVB_TYPE_ATSC_C},
+  {"ISDBT",  DVB_TYPE_ISDB_T},
+  {"ISDBC",  DVB_TYPE_ISDB_C},
+  {"ISDBS",  DVB_TYPE_ISDB_S}
 };
 dvb_str2val(type);
 
@@ -887,6 +978,8 @@ dvb_mux_conf_init ( dvb_mux_conf_t *dmc, dvb_fe_delivery_system_t delsys )
 static int
 dvb_mux_conf_str_dvbt ( dvb_mux_conf_t *dmc, char *buf, size_t bufsize )
 {
+  char hp[16];
+  snprintf(hp, sizeof(hp), "%s", dvb_fec2str(dmc->u.dmc_fe_ofdm.code_rate_HP));
   return
   snprintf(buf, bufsize,
            "%s freq %d bw %s cons %s hier %s code_rate %s:%s guard %s trans %s plp_id %d",
@@ -895,8 +988,7 @@ dvb_mux_conf_str_dvbt ( dvb_mux_conf_t *dmc, char *buf, size_t bufsize )
            dvb_bw2str(dmc->u.dmc_fe_ofdm.bandwidth),
            dvb_qam2str(dmc->dmc_fe_modulation),
            dvb_hier2str(dmc->u.dmc_fe_ofdm.hierarchy_information),
-           dvb_fec2str(dmc->u.dmc_fe_ofdm.code_rate_HP),
-           dvb_fec2str(dmc->u.dmc_fe_ofdm.code_rate_LP),
+           hp, dvb_fec2str(dmc->u.dmc_fe_ofdm.code_rate_LP),
            dvb_guard2str(dmc->u.dmc_fe_ofdm.guard_interval),
            dvb_mode2str(dmc->u.dmc_fe_ofdm.transmission_mode),
            dmc->dmc_fe_stream_id);
@@ -943,7 +1035,7 @@ dvb_mux_conf_str_dvbs ( dvb_mux_conf_t *dmc, char *buf, size_t bufsize )
 }
 
 static int
-dvb_mux_conf_str_atsc ( dvb_mux_conf_t *dmc, char *buf, size_t bufsize )
+dvb_mux_conf_str_atsc_t ( dvb_mux_conf_t *dmc, char *buf, size_t bufsize )
 {
   return
   snprintf(buf, bufsize,
@@ -963,11 +1055,12 @@ dvb_mux_conf_str ( dvb_mux_conf_t *dmc, char *buf, size_t bufsize )
   case DVB_TYPE_T:
     return dvb_mux_conf_str_dvbt(dmc, buf, bufsize);
   case DVB_TYPE_C:
+  case DVB_TYPE_ATSC_C:
     return dvb_mux_conf_str_dvbc(dmc, buf, bufsize);
   case DVB_TYPE_S:
     return dvb_mux_conf_str_dvbs(dmc, buf, bufsize);
-  case DVB_TYPE_ATSC:
-    return dvb_mux_conf_str_atsc(dmc, buf, bufsize);
+  case DVB_TYPE_ATSC_T:
+    return dvb_mux_conf_str_atsc_t(dmc, buf, bufsize);
   default:
     return
       snprintf(buf, bufsize, "UNKNOWN MUX CONFIG");

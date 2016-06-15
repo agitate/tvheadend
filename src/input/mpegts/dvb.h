@@ -212,7 +212,9 @@ struct lang_str *atsc_get_string
 
 #define bcdtoint(i) ((((i & 0xf0) >> 4) * 10) + (i & 0x0f))
 
-time_t dvb_convert_date(const uint8_t *dvb_buf, int local);
+htsmsg_t *dvb_timezone_enum(void *p, const char *lang);
+
+time_t dvb_convert_date(const uint8_t *dvb_buf, int tmzone);
 time_t atsc_convert_gpstime(uint32_t gpstime);
 void atsc_utf16_to_utf8(const uint8_t *src, int len, char *buf, int buflen);
 
@@ -378,8 +380,13 @@ typedef enum dvb_fe_type {
   DVB_TYPE_T = 1,		/* terrestrial */
   DVB_TYPE_C,			/* cable */
   DVB_TYPE_S,			/* satellite */
-  DVB_TYPE_ATSC,		/* terrestrial - north america */
-  DVB_TYPE_LAST = DVB_TYPE_ATSC
+  DVB_TYPE_ATSC_T,		/* terrestrial - north america */
+  DVB_TYPE_ATSC_C,		/* cable - north america */
+  DVB_TYPE_ISDB_T,              /* terrestrial - japan, brazil */
+  DVB_TYPE_ISDB_C,              /* cable - japan, brazil */
+  DVB_TYPE_ISDB_S,              /* satellite - japan, brazil */
+  DVB_TYPE_DAB,                 /* digital radio (europe) */
+  DVB_TYPE_LAST = DVB_TYPE_DAB
 } dvb_fe_type_t;
 
 typedef enum dvb_fe_spectral_inversion {
@@ -557,6 +564,17 @@ typedef struct dvb_ofdm_config {
   dvb_fe_hierarchy_t      hierarchy_information;
 } dvb_ofdm_config_t;
 
+typedef struct dvb_isdbt_config {
+  dvb_fe_bandwidth_t      bandwidth;
+  dvb_fe_guard_interval_t guard_interval;
+  struct {
+    dvb_fe_code_rate_t    fec;
+    dvb_fe_modulation_t   modulation;
+    uint32_t              segment_count;
+    uint32_t              time_interleaving;
+  } layers[3];
+} dvb_isdbt_config_t;
+
 typedef struct dvb_mux_conf
 {
   dvb_fe_type_t               dmc_fe_type;
@@ -573,6 +591,7 @@ typedef struct dvb_mux_conf
     dvb_qpsk_config_t         dmc_fe_qpsk;
     dvb_qam_config_t          dmc_fe_qam;
     dvb_ofdm_config_t         dmc_fe_ofdm;
+    dvb_isdbt_config_t        dmc_fe_isdbt;
   } u;
 
   // For scan file configurations
@@ -627,6 +646,13 @@ int dvb_mux_conf_str ( dvb_mux_conf_t *conf, char *buf, size_t bufsize );
 const char *dvb_sat_position_to_str( int position, char *buf, size_t buflen );
 
 const int dvb_sat_position_from_str( const char *buf );
+
+static inline int dvb_modulation_is_none_or_auto ( int modulation )
+{
+  return modulation == DVB_MOD_NONE ||
+         modulation == DVB_MOD_AUTO ||
+         modulation == DVB_MOD_QAM_AUTO;
+}
 
 #endif /* ENABLE_MPEGTS_DVB */
 

@@ -38,10 +38,11 @@ api_epggrab_module_list
 {
   htsmsg_t *l = htsmsg_create_list(), *m;
   epggrab_module_t *mod;
+  char ubuf[UUID_HEX_SIZE];
   pthread_mutex_lock(&global_lock);
   LIST_FOREACH(mod, &epggrab_modules, link) {
     m = htsmsg_create_map();
-    htsmsg_add_str(m, "uuid", idnode_uuid_as_sstr(&mod->idnode));
+    htsmsg_add_str(m, "uuid", idnode_uuid_as_str(&mod->idnode, ubuf));
     htsmsg_add_str(m, "status", epggrab_module_get_status(mod));
     htsmsg_add_str(m, "title", idnode_get_title(&mod->idnode, perm->aa_lang_ui));
     htsmsg_add_msg(l, NULL, m);
@@ -67,6 +68,21 @@ api_epggrab_ota_trigger
   return 0;
 }
 
+static int
+api_epggrab_rerun_internal
+  ( access_t *perm, void *opaque, const char *op, htsmsg_t *args, htsmsg_t **resp )
+{
+  int32_t s32;
+  if (htsmsg_get_s32(args, "rerun", &s32))
+    return EINVAL;
+  if (s32 > 0) {
+    pthread_mutex_lock(&global_lock);
+    epggrab_rerun_internal();
+    pthread_mutex_unlock(&global_lock);
+  }
+  return 0;
+}
+
 void api_epggrab_init ( void )
 {
   static api_hook_t ah[] = {
@@ -78,6 +94,7 @@ void api_epggrab_init ( void )
     { "epggrab/config/load",  ACCESS_ADMIN, api_idnode_load_simple, &epggrab_conf.idnode },
     { "epggrab/config/save",  ACCESS_ADMIN, api_idnode_save_simple, &epggrab_conf.idnode },
     { "epggrab/ota/trigger",  ACCESS_ADMIN, api_epggrab_ota_trigger, NULL },
+    { "epggrab/internal/rerun",  ACCESS_ADMIN, api_epggrab_rerun_internal, NULL },
     { NULL },
   };
 

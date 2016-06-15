@@ -140,6 +140,14 @@ page_root(http_connection_t *hc, const char *remain, void *opaque)
 static int
 page_root2(http_connection_t *hc, const char *remain, void *opaque)
 {
+  if (!tvheadend_webroot) return 1;
+  http_redirect(hc, "/", &hc->hc_req_args, 0);
+  return 0;
+}
+
+static int
+page_no_webroot(http_connection_t *hc, const char *remain, void *opaque)
+{
   size_t l;
   char *s;
 
@@ -241,6 +249,8 @@ page_static_file(http_connection_t *hc, const char *_remain, void *opaque)
       nogzip = 1;
     else if(!strcmp(postfix, "jpg"))
       nogzip = 1;
+    else if(!strcmp(postfix, "png"))
+      nogzip = 1;
   }
 
   fb_file *fp = fb_open(path, 0, (nogzip || gzip) ? 0 : 1);
@@ -303,16 +313,13 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
 		const char *name, th_subscription_t *s)
 {
   streaming_message_t *sm;
-  int run = 1;
-  int started = 0;
+  int run = 1, started = 0;
   streaming_queue_t *sq = &prch->prch_sq;
   muxer_t *mux = prch->prch_muxer;
-  time_t lastpkt;
-  int ptimeout, grace = 20;
-  struct timespec ts;
-  struct timeval  tp;
+  int ptimeout, grace = 20, r;
+  struct timeval tp;
   streaming_start_t *ss_copy;
-  int64_t mono;
+  int64_t lastpkt, mono;
 
   if(muxer_open_stream(mux, hc->hc_fd))
     run = 0;
@@ -324,7 +331,7 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
   if (config.dscp >= 0)
     socket_set_dscp(hc->hc_fd, config.dscp, NULL, 0);
 
-  lastpkt = dispatch_clock;
+  lastpkt = mclk();
   ptimeout = prch->prch_pro ? prch->prch_pro->pro_timeout : 5;
 
   if (hc->hc_no_output) {
@@ -333,26 +340,26 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
     pthread_mutex_unlock(&sq->sq_mutex);
   }
 
-  while(!hc->hc_shutdown && run && tvheadend_running) {
+  while(!hc->hc_shutdown && run && tvheadend_is_running()) {
     pthread_mutex_lock(&sq->sq_mutex);
     sm = TAILQ_FIRST(&sq->sq_queue);
     if(sm == NULL) {
-      gettimeofday(&tp, NULL);
-      ts.tv_sec  = tp.tv_sec + 1;
-      ts.tv_nsec = tp.tv_usec * 1000;
-
-      if(pthread_cond_timedwait(&sq->sq_cond, &sq->sq_mutex, &ts) == ETIMEDOUT) {
-
-        /* Check socket status */
-        if (tcp_socket_dead(hc->hc_fd)) {
-          tvhlog(LOG_DEBUG, "webui",  "Stop streaming %s, client hung up", hc->hc_url_orig);
-          run = 0;
-        } else if((!started && dispatch_clock - lastpkt > grace) ||
-                   (started && ptimeout > 0 && dispatch_clock - lastpkt > ptimeout)) {
-          tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, timeout waiting for packets", hc->hc_url_orig);
-          run = 0;
+      mono = mclk() + sec2mono(1);
+      do {
+        r = tvh_cond_timedwait(&sq->sq_cond, &sq->sq_mutex, mono);
+        if (r == ETIMEDOUT) {
+          /* Check socket status */
+          if (tcp_socket_dead(hc->hc_fd)) {
+            tvhlog(LOG_DEBUG, "webui",  "Stop streaming %s, client hung up", hc->hc_url_orig);
+            run = 0;
+          } else if((!started && mclk() - lastpkt > sec2mono(grace)) ||
+                     (started && ptimeout > 0 && mclk() - lastpkt > sec2mono(ptimeout))) {
+            tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, timeout waiting for packets", hc->hc_url_orig);
+            run = 0;
+          }
+          break;
         }
-      }
+      } while (ERRNO_AGAIN(r));
       pthread_mutex_unlock(&sq->sq_mutex);
       continue;
     }
@@ -372,7 +379,7 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
           pb = sm->sm_data;
         subscription_add_bytes_out(s, len = pktbuf_len(pb));
         if (len > 0)
-          lastpkt = dispatch_clock;
+          lastpkt = mclk();
         muxer_write_pkt(mux, sm->sm_type, sm->sm_data);
         sm->sm_data = NULL;
       }
@@ -391,11 +398,11 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
 
         if (hc->hc_no_output) {
           streaming_msg_free(sm);
-          mono = getmonoclock() + 2000000;
-          while (getmonoclock() < mono) {
+          mono = mclk() + sec2mono(2);
+          while (mclk() < mono) {
             if (tcp_socket_dead(hc->hc_fd))
               break;
-            usleep(50000);
+            tvh_safe_usleep(50000);
           }
           return;
         }
@@ -424,8 +431,8 @@ http_stream_run(http_connection_t *hc, profile_chain_t *prch,
         tvhlog(LOG_DEBUG, "webui",  "Stop streaming %s, client hung up",
                hc->hc_url_orig);
         run = 0;
-      } else if((!started && dispatch_clock - lastpkt > grace) ||
-                 (started && ptimeout > 0 && dispatch_clock - lastpkt > ptimeout)) {
+      } else if((!started && mclk() - lastpkt > sec2mono(grace)) ||
+                 (started && ptimeout > 0 && mclk() - lastpkt > sec2mono(ptimeout))) {
         tvhlog(LOG_WARNING, "webui",  "Stop streaming %s, timeout waiting for packets", hc->hc_url_orig);
         run = 0;
       }
@@ -548,6 +555,7 @@ http_channel_playlist(http_connection_t *hc, int pltype, channel_t *channel)
   char buf[255];
   char *profile, *hostpath;
   const char *name;
+  char ubuf[UUID_HEX_SIZE];
 
   if (http_access_verify_channel(hc, ACCESS_STREAMING, channel))
     return HTTP_STATUS_UNAUTHORIZED;
@@ -566,7 +574,7 @@ http_channel_playlist(http_connection_t *hc, int pltype, channel_t *channel)
     htsbuf_append_str(hq, "#EXTM3U\n");
     http_m3u_playlist_add(hq, hostpath, buf, profile, name,
                           channel_get_icon(channel),
-                          channel_get_suuid(channel),
+                          channel_get_uuid(channel, ubuf),
                           hc->hc_access);
 
   } else if (pltype == PLAYLIST_E2) {
@@ -593,7 +601,7 @@ static int
 http_tag_playlist(http_connection_t *hc, int pltype, channel_tag_t *tag)
 {
   htsbuf_queue_t *hq;
-  char buf[255];
+  char buf[255], ubuf[UUID_HEX_SIZE];
   idnode_list_mapping_t *ilm;
   char *profile, *hostpath;
   const char *name;
@@ -641,7 +649,7 @@ http_tag_playlist(http_connection_t *hc, int pltype, channel_tag_t *tag)
     if (pltype == PLAYLIST_M3U) {
       http_m3u_playlist_add(hq, hostpath, buf, profile, name,
                             channel_get_icon(ch),
-                            channel_get_suuid(ch),
+                            channel_get_uuid(ch, ubuf),
                             hc->hc_access);
     } else if (pltype == PLAYLIST_E2) {
       htsbuf_qprintf(hq, "#NAME %s\n", name);
@@ -764,7 +772,7 @@ static int
 http_channel_list_playlist(http_connection_t *hc, int pltype)
 {
   htsbuf_queue_t *hq;
-  char buf[255];
+  char buf[255], ubuf[UUID_HEX_SIZE];
   channel_t *ch;
   channel_t **chlist;
   int idx = 0, count = 0;
@@ -807,7 +815,7 @@ http_channel_list_playlist(http_connection_t *hc, int pltype)
     if (pltype == PLAYLIST_M3U) {
       http_m3u_playlist_add(hq, hostpath, buf, profile, name,
                             channel_get_icon(ch),
-                            channel_get_suuid(ch),
+                            channel_get_uuid(ch, ubuf),
                             hc->hc_access);
     } else if (pltype == PLAYLIST_E2) {
       http_e2_playlist_add(hq, hostpath, buf, profile, name);
@@ -832,7 +840,7 @@ static int
 http_dvr_list_playlist(http_connection_t *hc, int pltype)
 {
   htsbuf_queue_t *hq;
-  char buf[255];
+  char buf[255], ubuf[UUID_HEX_SIZE];
   dvr_entry_t *de;
   const char *uuid;
   char *hostpath;
@@ -849,7 +857,7 @@ http_dvr_list_playlist(http_connection_t *hc, int pltype)
 
   htsbuf_append_str(hq, "#EXTM3U\n");
   LIST_FOREACH(de, &dvrentries, de_global_link) {
-    fsize = dvr_get_filesize(de);
+    fsize = dvr_get_filesize(de, 0);
     if(!fsize)
       continue;
 
@@ -864,7 +872,7 @@ http_dvr_list_playlist(http_connection_t *hc, int pltype)
     htsbuf_qprintf(hq, "#EXTINF:%"PRItime_t",%s\n", durration, lang_str_get(de->de_title, NULL));
     
     htsbuf_qprintf(hq, "#EXT-X-TARGETDURATION:%"PRItime_t"\n", durration);
-    uuid = idnode_uuid_as_sstr(&de->de_id);
+    uuid = idnode_uuid_as_str(&de->de_id, ubuf);
     htsbuf_qprintf(hq, "#EXT-X-STREAM-INF:PROGRAM-ID=%s,BANDWIDTH=%d\n", uuid, bandwidth);
     htsbuf_qprintf(hq, "#EXT-X-PROGRAM-DATE-TIME:%s\n", buf);
 
@@ -884,7 +892,7 @@ static int
 http_dvr_playlist(http_connection_t *hc, int pltype, dvr_entry_t *de)
 {
   htsbuf_queue_t *hq = &hc->hc_reply;
-  char buf[255];
+  char buf[255], ubuf[UUID_HEX_SIZE];
   const char *ticket_id = NULL, *uuid;
   time_t durration = 0;
   off_t fsize = 0;
@@ -903,7 +911,7 @@ http_dvr_playlist(http_connection_t *hc, int pltype, dvr_entry_t *de)
 
   hostpath  = http_get_hostpath(hc);
   durration  = dvr_entry_get_stop_time(de) - dvr_entry_get_start_time(de, 0);
-  fsize = dvr_get_filesize(de);
+  fsize = dvr_get_filesize(de, 0);
 
   if(fsize) {
     bandwidth = ((8*fsize) / (durration*1024.0));
@@ -913,7 +921,7 @@ http_dvr_playlist(http_connection_t *hc, int pltype, dvr_entry_t *de)
     htsbuf_qprintf(hq, "#EXTINF:%"PRItime_t",%s\n", durration, lang_str_get(de->de_title, NULL));
     
     htsbuf_qprintf(hq, "#EXT-X-TARGETDURATION:%"PRItime_t"\n", durration);
-    uuid = idnode_uuid_as_sstr(&de->de_id);
+    uuid = idnode_uuid_as_str(&de->de_id, ubuf);
     htsbuf_qprintf(hq, "#EXT-X-STREAM-INF:PROGRAM-ID=%s,BANDWIDTH=%d\n", uuid, bandwidth);
     htsbuf_qprintf(hq, "#EXT-X-PROGRAM-DATE-TIME:%s\n", buf);
 
@@ -1730,8 +1738,7 @@ webui_static_content(const char *http_path, const char *source)
 static int
 favicon(http_connection_t *hc, const char *remain, void *opaque)
 {
-  http_redirect(hc, "static/htslogo.png", NULL, 0);
-  return 0;
+  return page_static_file(hc, "logo.png", (void *)"src/webui/static/img");
 }
 
 /**
@@ -1753,7 +1760,7 @@ static int http_file_test(const char *path)
 static int
 http_redir(http_connection_t *hc, const char *remain, void *opaque)
 {
-  const char *lang;
+  const char *lang, *theme;
   char *components[3];
   char buf[256];
   int nc;
@@ -1782,18 +1789,41 @@ http_redir(http_connection_t *hc, const char *remain, void *opaque)
       pthread_mutex_unlock(&hc->hc_fd_lock);
       return 0;
     }
-  }
-
-  if (nc >= 2) {
-    if (!strcmp(components[0], "docs")) {
-      lang = tvh_gettext_get_lang(hc->hc_access->aa_lang_ui);
-      snprintf(buf, sizeof(buf), "docs/html/%s/%s%s%s", lang, components[1],
-                                 nc > 2 ? "/" : "", nc > 2 ? components[1] : "");
-      if (http_file_test(buf)) lang = "en";
-      snprintf(buf, sizeof(buf), "/docs/%s/%s%s%s", lang, components[1],
-                                 nc > 2 ? "/" : "", nc > 2 ? components[1] : "");
-      http_redirect(hc, buf, NULL, 0);
-      return 0;
+    if (!strcmp(components[0], "theme.css")) {
+      theme = access_get_theme(hc->hc_access);
+      if (theme) {
+        snprintf(buf, sizeof(buf), "src/webui/static/tvh.%s.css.gz", theme);
+        if (!http_file_test(buf)) {
+          snprintf(buf, sizeof(buf), "/static/tvh.%s.css.gz", theme);
+          http_css_import(hc, buf);
+          return 0;
+        }
+      }
+      return HTTP_STATUS_BAD_REQUEST;
+    }
+    if (!strcmp(components[0], "theme.debug.css")) {
+      theme = access_get_theme(hc->hc_access);
+      if (theme) {
+        snprintf(buf, sizeof(buf), "src/webui/static/extjs/resources/css/xtheme-%s.css", theme);
+        if (!http_file_test(buf)) {
+          snprintf(buf, sizeof(buf), "/static/extjs/resources/css/xtheme-%s.css", theme);
+          http_css_import(hc, buf);
+          return 0;
+        }
+      }
+      return HTTP_STATUS_BAD_REQUEST;
+    }
+    if (!strcmp(components[0], "theme.app.debug.css")) {
+      theme = access_get_theme(hc->hc_access);
+      if (theme) {
+        snprintf(buf, sizeof(buf), "src/webui/static/app/ext-%s.css", theme);
+        if (!http_file_test(buf)) {
+          snprintf(buf, sizeof(buf), "/static/app/ext-%s.css", theme);
+          http_css_import(hc, buf);
+          return 0;
+        }
+      }
+      return HTTP_STATUS_BAD_REQUEST;
     }
   }
 
@@ -1817,9 +1847,10 @@ webui_init(int xspf)
 
   s = tvheadend_webroot;
   tvheadend_webroot = NULL;
-  http_path_add("", NULL, page_root2, ACCESS_WEB_INTERFACE);
+  http_path_add("", NULL, page_no_webroot, ACCESS_WEB_INTERFACE);
   tvheadend_webroot = s;
 
+  http_path_add("", NULL, page_root2, ACCESS_WEB_INTERFACE);
   http_path_add("/", NULL, page_root, ACCESS_WEB_INTERFACE);
   http_path_add("/login", NULL, page_login, ACCESS_WEB_INTERFACE);
   http_path_add("/logout", NULL, page_logout, ACCESS_WEB_INTERFACE);
@@ -1833,6 +1864,7 @@ webui_init(int xspf)
   http_path_add("/favicon.ico", NULL, favicon, ACCESS_WEB_INTERFACE);
   http_path_add("/playlist", NULL, page_http_playlist, ACCESS_ANONYMOUS);
   http_path_add("/xmltv", NULL, page_xmltv, ACCESS_ANONYMOUS);
+  http_path_add("/markdown", NULL, page_markdown, ACCESS_ANONYMOUS);
 
   http_path_add("/state", NULL, page_statedump, ACCESS_ADMIN);
 
@@ -1843,8 +1875,6 @@ webui_init(int xspf)
   http_path_add("/redir",  NULL, http_redir, ACCESS_ANONYMOUS);
 
   webui_static_content("/static",        "src/webui/static");
-  webui_static_content("/docs",          "docs/html");
-  webui_static_content("/docresources",  "docs/docresources");
 
   simpleui_start();
   extjs_start();

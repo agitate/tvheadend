@@ -121,6 +121,7 @@ tcp_connect(const char *hostname, int port, const char *bindaddr,
   } else {
     snprintf(errbuf, errbufsize, "Invalid protocol family");
     freeaddrinfo(ai);
+    close(fd);
     return -1;
   }
 
@@ -147,7 +148,7 @@ tcp_connect(const char *hostname, int port, const char *bindaddr,
         timeout = 0;
 
       while (1) {
-        if (!tvheadend_running) {
+        if (!tvheadend_is_running()) {
           errbuf[0] = '\0';
           tvhpoll_destroy(efd);
           close(fd);
@@ -351,7 +352,7 @@ tcp_read_timeout(int fd, void *buf, size_t len, int timeout)
     if(x == 0)
       return ETIMEDOUT;
     if(x == -1) {
-      if (!tvheadend_running)
+      if (!tvheadend_is_running())
         return ECONNRESET;
       if (ERRNO_AGAIN(errno))
         continue;
@@ -453,6 +454,7 @@ typedef struct tcp_server {
   struct sockaddr_storage bound;
   tcp_server_ops_t ops;
   void *opaque;
+  LIST_ENTRY(tcp_server) link;
 } tcp_server_t;
 
 typedef struct tcp_server_launch {
@@ -471,6 +473,7 @@ typedef struct tcp_server_launch {
   LIST_ENTRY(tcp_server_launch) jlink;
 } tcp_server_launch_t;
 
+static LIST_HEAD(, tcp_server) tcp_server_delete_list = { 0 };
 static LIST_HEAD(, tcp_server_launch) tcp_server_launches = { 0 };
 static LIST_HEAD(, tcp_server_launch) tcp_server_active = { 0 };
 static LIST_HEAD(, tcp_server_launch) tcp_server_join = { 0 };
@@ -504,7 +507,7 @@ tcp_connection_launch
 {
   tcp_server_launch_t *tsl, *res;
   uint32_t used = 0, used2;
-  time_t started = dispatch_clock;
+  int64_t started = mclk();
   int c1, c2;
 
   lock_assert(&global_lock);
@@ -536,7 +539,7 @@ try_again:
     c2 = aa->aa_conn_limit_streaming ? used >= aa->aa_conn_limit_streaming : -1;
 
     if (c1 && c2) {
-      if (started + 3 < dispatch_clock) {
+      if (started + sec2mono(3) < mclk()) {
         tvherror("tcp", "multiple connections are not allowed for user '%s' from '%s' "
                         "(limit %u, streaming limit %u, active streaming %u, DVR %u)",
                  aa->aa_username ?: "", aa->aa_representative ?: "",
@@ -545,9 +548,9 @@ try_again:
         return NULL;
       }
       pthread_mutex_unlock(&global_lock);
-      usleep(250000);
+      tvh_safe_usleep(250000);
       pthread_mutex_lock(&global_lock);
-      if (tvheadend_running)
+      if (tvheadend_is_running())
         goto try_again;
       return NULL;
     }
@@ -646,7 +649,8 @@ tcp_server_start(void *aux)
   LIST_REMOVE(tsl, alink);
   LIST_INSERT_HEAD(&tcp_server_join, tsl, jlink);
   pthread_mutex_unlock(&global_lock);
-  tvh_write(tcp_server_pipe.wr, &c, 1);
+  if (atomic_get(&tcp_server_running))
+    tvh_write(tcp_server_pipe.wr, &c, 1);
   return NULL;
 }
 
@@ -664,10 +668,12 @@ tcp_server_loop(void *aux)
   socklen_t slen;
   char c;
 
-  while(tcp_server_running) {
+  while(atomic_get(&tcp_server_running)) {
     r = tvhpoll_wait(tcp_server_poll, &ev, 1, -1);
-    if(r == -1) {
-      perror("tcp_server: tvhpoll_wait");
+    if(r < 0) {
+      if (ERRNO_AGAIN(-r))
+        continue;
+      tvherror("tcp", "tcp_server_loop: tvhpoll_wait: %s", strerror(errno));
       continue;
     }
 
@@ -684,6 +690,10 @@ next:
           pthread_join(tsl->tid, NULL);
           free(tsl);
           goto next;
+        }
+        while ((ts = LIST_FIRST(&tcp_server_delete_list)) != NULL) {
+          LIST_REMOVE(ts, link);
+          free(ts);
         }
         pthread_mutex_unlock(&global_lock);
       }
@@ -919,6 +929,7 @@ tcp_server_delete(void *server)
 {
   tcp_server_t *ts = server;
   tvhpoll_event_t ev;
+  char c = 'D';
 
   if (server == NULL)
     return;
@@ -927,8 +938,11 @@ tcp_server_delete(void *server)
   ev.fd       = ts->serverfd;
   ev.events   = TVHPOLL_IN;
   ev.data.ptr = ts;
-  tvhpoll_rem(tcp_server_poll, &ev, 1);  
-  free(ts);
+  tvhpoll_rem(tcp_server_poll, &ev, 1);
+  close(ts->serverfd);
+  ts->serverfd = -1;
+  LIST_INSERT_HEAD(&tcp_server_delete_list, ts, link);
+  tvh_write(tcp_server_pipe.wr, &c, 1);
 }
 
 /**
@@ -1016,6 +1030,26 @@ tcp_server_bound ( void *server, struct sockaddr_storage *bound, int family )
   return 0;
 }
 
+/**
+ *
+ */
+int
+tcp_server_onall ( void *server )
+{
+  tcp_server_t *ts = server;
+  int i, len;
+  uint8_t *ptr;
+
+  if (server == NULL) return 0;
+
+  len = IP_IN_ADDRLEN(ts->bound);
+  ptr = (uint8_t *)IP_IN_ADDR(ts->bound);
+  for (i = 0; i < len; i++)
+    if (ptr[0])
+      break;
+  return i >= len;
+}
+
 /*
  * Connections status
  */
@@ -1074,18 +1108,19 @@ tcp_server_init(void)
   ev.data.ptr = &tcp_server_pipe;
   tvhpoll_add(tcp_server_poll, &ev, 1);
 
-  tcp_server_running = 1;
+  atomic_set(&tcp_server_running, 1);
   tvhthread_create(&tcp_server_tid, NULL, tcp_server_loop, NULL, "tcp-loop");
 }
 
 void
 tcp_server_done(void)
 {
+  tcp_server_t *ts;
   tcp_server_launch_t *tsl;  
   char c = 'E';
   int64_t t;
 
-  tcp_server_running = 0;
+  atomic_set(&tcp_server_running, 0);
   tvh_write(tcp_server_pipe.wr, &c, 1);
 
   pthread_mutex_lock(&global_lock);
@@ -1102,20 +1137,25 @@ tcp_server_done(void)
   tvh_pipe_close(&tcp_server_pipe);
   tvhpoll_destroy(tcp_server_poll);
   
-  t = getmonoclock();
-  while (LIST_FIRST(&tcp_server_active) != NULL) {
-    if (getmonoclock() - t > 5000000)
-      tvhtrace("tcp", "tcp server %p active too long", LIST_FIRST(&tcp_server_active));
-    usleep(20000);
-  }
-
   pthread_mutex_lock(&global_lock);
+  t = mclk();
+  while (LIST_FIRST(&tcp_server_active) != NULL) {
+    if (t + sec2mono(5) < mclk())
+      tvhtrace("tcp", "tcp server %p active too long", LIST_FIRST(&tcp_server_active));
+    pthread_mutex_unlock(&global_lock);
+    tvh_safe_usleep(20000);
+    pthread_mutex_lock(&global_lock);
+  }
   while ((tsl = LIST_FIRST(&tcp_server_join)) != NULL) {
     LIST_REMOVE(tsl, jlink);
     pthread_mutex_unlock(&global_lock);
     pthread_join(tsl->tid, NULL);
     free(tsl);
     pthread_mutex_lock(&global_lock);
+  }
+  while ((ts = LIST_FIRST(&tcp_server_delete_list)) != NULL) {
+    LIST_REMOVE(ts, link);
+    free(ts);
   }
   pthread_mutex_unlock(&global_lock);
 }

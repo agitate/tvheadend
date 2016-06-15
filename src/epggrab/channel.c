@@ -82,13 +82,13 @@ int epggrab_channel_match_name ( epggrab_channel_t *ec, channel_t *ch )
   if (name == NULL)
     return 0;
 
-  if (ec->name && !strcmp(ec->name, name))
+  if (ec->name && !strcasecmp(ec->name, name))
     return 1;
 
   if (ec->names)
     HTSMSG_FOREACH(f, ec->names)
       if ((s = htsmsg_field_get_str(f)) != NULL)
-        if (!strcmp(s, name))
+        if (!strcasecmp(s, name))
           return 1;
 
   return 0;
@@ -139,11 +139,26 @@ static void epggrab_channel_links_delete( epggrab_channel_t *ec, int delconf )
     _epgggrab_channel_link_delete(ilm, delconf);
 }
 
+/* Do update */
+static void
+epggrab_channel_sync( epggrab_channel_t *ec, channel_t *ch )
+{
+  int save = 0;
+
+  if (ec->update_chname && ec->name && epggrab_conf.channel_rename)
+    save |= channel_set_name(ch, ec->name);
+  if (ec->update_chnum && ec->lcn > 0 && epggrab_conf.channel_renumber)
+    save |= channel_set_number(ch, ec->lcn / CHANNEL_SPLIT, ec->lcn % CHANNEL_SPLIT);
+  if (ec->update_chicon && ec->icon && epggrab_conf.channel_reicon)
+    save |= channel_set_icon(ch, ec->icon);
+  if (save)
+    idnode_changed(&ch->ch_id);
+}
+
 /* Link epggrab channel to real channel */
 int
 epggrab_channel_link ( epggrab_channel_t *ec, channel_t *ch, void *origin )
 {
-  int save = 0;
   idnode_list_mapping_t *ilm;
 
   /* No change */
@@ -151,8 +166,10 @@ epggrab_channel_link ( epggrab_channel_t *ec, channel_t *ch, void *origin )
 
   /* Already linked */
   LIST_FOREACH(ilm, &ec->channels, ilm_in1_link)
-    if (ilm->ilm_in2 == &ch->ch_id)
+    if (ilm->ilm_in2 == &ch->ch_id) {
+      epggrab_channel_sync(ec, ch);
       return 0;
+    }
 
   /* New link */
   tvhdebug(ec->mod->id, "linking %s to %s",
@@ -164,17 +181,10 @@ epggrab_channel_link ( epggrab_channel_t *ec, channel_t *ch, void *origin )
   if (ilm == NULL)
     return 0;
 
-  if (ec->name && epggrab_conf.channel_rename)
-    save |= channel_set_name(ch, ec->name);
-  if (ec->lcn > 0 && epggrab_conf.channel_renumber)
-    save |= channel_set_number(ch, ec->lcn / CHANNEL_SPLIT, ec->lcn % CHANNEL_SPLIT);
-  if (ec->icon && epggrab_conf.channel_reicon)
-    save |= channel_set_icon(ch, ec->icon);
-  if (save)
-    channel_save(ch);
+  epggrab_channel_sync(ec, ch);
 
   if (origin == NULL)
-    epggrab_channel_save(ec);
+    idnode_changed(&ec->idnode);
   return 1;
 }
 
@@ -198,7 +208,7 @@ int epggrab_channel_set_name ( epggrab_channel_t *ec, const char *name )
       LIST_FOREACH(ilm, &ec->channels, ilm_in1_link) {
         ch = (channel_t *)ilm->ilm_in2;
         if (channel_set_name(ch, name))
-          channel_save(ch);
+          idnode_changed(&ch->ch_id);
       }
     }
     save = 1;
@@ -224,7 +234,7 @@ int epggrab_channel_set_icon ( epggrab_channel_t *ec, const char *icon )
       LIST_FOREACH(ilm, &ec->channels, ilm_in1_link) {
         ch = (channel_t *)ilm->ilm_in2;
         if (channel_set_icon(ch, icon))
-          channel_save(ch);
+          idnode_changed(&ch->ch_id);
       }
     }
     save = 1;
@@ -250,7 +260,7 @@ int epggrab_channel_set_number ( epggrab_channel_t *ec, int major, int minor )
         if (channel_set_number(ch,
                                lcn / CHANNEL_SPLIT,
                                lcn % CHANNEL_SPLIT))
-          channel_save(ch);
+          idnode_changed(&ch->ch_id);
       }
     }
     save = 1;
@@ -303,7 +313,7 @@ void epggrab_channel_updated ( epggrab_channel_t *ec )
     epggrab_channel_autolink(ec);
 
   /* Save */
-  epggrab_channel_save(ec);
+  idnode_changed(&ec->idnode);
 }
 
 /* ID comparison */
@@ -332,12 +342,19 @@ epggrab_channel_t *epggrab_channel_create
 
   ec->mod = owner;
   ec->enabled = 1;
+  ec->update_chicon = 1;
+  ec->update_chnum = 1;
+  ec->update_chname = 1;
 
   if (conf)
     idnode_load(&ec->idnode, conf);
 
   TAILQ_INSERT_TAIL(&epggrab_channel_entries, ec, all_link);
-  if (RB_INSERT_SORTED(&owner->channels, ec, link, _ch_id_cmp)) abort();
+  if (RB_INSERT_SORTED(&owner->channels, ec, link, _ch_id_cmp)) {
+    tvherror("epggrab", "removing duplicate channel id '%s' (uuid '%s')", ec->id, uuid);
+    epggrab_channel_destroy(ec, 1, 0);
+    return NULL;
+  }
 
   return ec;
 }
@@ -383,28 +400,24 @@ epggrab_channel_t *epggrab_channel_find
   return ec;
 }
 
-void epggrab_channel_save( epggrab_channel_t *ec )
+void epggrab_channel_destroy( epggrab_channel_t *ec, int delconf, int rb_remove )
 {
-  htsmsg_t *m = htsmsg_create_map();
-  idnode_save(&ec->idnode, m);
-  hts_settings_save(m, "epggrab/%s/channels/%s",
-                    ec->mod->saveid, idnode_uuid_as_sstr(&ec->idnode));
-  htsmsg_destroy(m);
-}
+  char ubuf[UUID_HEX_SIZE];
 
-void epggrab_channel_destroy( epggrab_channel_t *ec, int delconf )
-{
   if (ec == NULL) return;
+
+  idnode_save_check(&ec->idnode, delconf);
 
   /* Already linked */
   epggrab_channel_links_delete(ec, 0);
-  RB_REMOVE(&ec->mod->channels, ec, link);
+  if (rb_remove)
+    RB_REMOVE(&ec->mod->channels, ec, link);
   TAILQ_REMOVE(&epggrab_channel_entries, ec, all_link);
   idnode_unlink(&ec->idnode);
 
   if (delconf)
     hts_settings_remove("epggrab/%s/channels/%s",
-                        ec->mod->saveid, idnode_uuid_as_sstr(&ec->idnode));
+                        ec->mod->saveid, idnode_uuid_as_str(&ec->idnode, ubuf));
 
   htsmsg_destroy(ec->newnames);
   htsmsg_destroy(ec->names);
@@ -420,7 +433,7 @@ void epggrab_channel_flush
 {
   epggrab_channel_t *ec;
   while ((ec = RB_FIRST(&mod->channels)) != NULL)
-    epggrab_channel_destroy(ec, delconf);
+    epggrab_channel_destroy(ec, delconf, 1);
 }
 
 void epggrab_channel_begin_scan ( epggrab_module_t *mod )
@@ -530,16 +543,22 @@ epggrab_channel_class_get_title(idnode_t *self, const char *lang)
   return prop_sbuf;
 }
 
-static void
-epggrab_channel_class_save(idnode_t *self)
+static htsmsg_t *
+epggrab_channel_class_save(idnode_t *self, char *filename, size_t fsize)
 {
-  epggrab_channel_save((epggrab_channel_t *)self);
+  epggrab_channel_t *ec = (epggrab_channel_t *)self;
+  htsmsg_t *m = htsmsg_create_map();
+  char ubuf[UUID_HEX_SIZE];
+  idnode_save(&ec->idnode, m);
+  snprintf(filename, fsize, "epggrab/%s/channels/%s",
+           ec->mod->saveid, idnode_uuid_as_str(&ec->idnode, ubuf));
+  return m;
 }
 
 static void
 epggrab_channel_class_delete(idnode_t *self)
 {
-  epggrab_channel_destroy((epggrab_channel_t *)self, 1);
+  epggrab_channel_destroy((epggrab_channel_t *)self, 1, 1);
 }
 
 static const void *
@@ -622,6 +641,64 @@ epggrab_channel_class_channels_rend ( void *obj, const char *lang )
   return idnode_list_get_csv1(&ec->channels, lang);
 }
 
+static idnode_slist_t epggrab_channel_class_update_slist[] = {
+  {
+    .id   = "update_icon",
+    .name = N_("Icon"),
+    .off  = offsetof(epggrab_channel_t, update_chicon),
+  },
+  {
+    .id   = "update_chnum",
+    .name = N_("Number"),
+    .off  = offsetof(epggrab_channel_t, update_chnum),
+  },
+  {
+    .id   = "update_chname",
+    .name = N_("Name"),
+    .off  = offsetof(epggrab_channel_t, update_chname),
+  },
+  {}
+};
+
+static htsmsg_t *
+epggrab_channel_class_update_enum ( void *obj, const char *lang )
+{
+  return idnode_slist_enum(obj, epggrab_channel_class_update_slist, lang);
+}
+
+static const void *
+epggrab_channel_class_update_get ( void *obj )
+{
+  return idnode_slist_get(obj, epggrab_channel_class_update_slist);
+}
+
+static char *
+epggrab_channel_class_update_rend ( void *obj, const char *lang )
+{
+  return idnode_slist_rend(obj, epggrab_channel_class_update_slist, lang);
+}
+
+static int
+epggrab_channel_class_update_set ( void *obj, const void *p )
+{
+  return idnode_slist_set(obj, epggrab_channel_class_update_slist, p);
+}
+
+static void
+epggrab_channel_class_update_notify ( void *obj, const char *lang )
+{
+  epggrab_channel_t *ec = obj;
+  channel_t *ch;
+  idnode_list_mapping_t *ilm;
+
+  if (!ec->update_chicon && !ec->update_chnum && !ec->update_chname)
+    return;
+  LIST_FOREACH(ilm, &ec->channels, ilm_in1_link) {
+    ch = (channel_t *)ilm->ilm_in2;
+    epggrab_channel_sync(ec, ch);
+  }
+}
+
 static void
 epggrab_channel_class_only_one_notify ( void *obj, const char *lang )
 {
@@ -642,9 +719,12 @@ epggrab_channel_class_only_one_notify ( void *obj, const char *lang )
   }
 }
 
+CLASS_DOC(epggrabber_channel)
+
 const idclass_t epggrab_channel_class = {
   .ic_class      = "epggrab_channel",
-  .ic_caption    = N_("EPG grabber channel"),
+  .ic_caption    = N_("EPG Grabber Channel"),
+  .ic_doc        = tvh_doc_epggrabber_channel_class,
   .ic_event      = "epggrab_channel",
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_save       = epggrab_channel_class_save,
@@ -662,6 +742,7 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_BOOL,
       .id       = "enabled",
       .name     = N_("Enabled"),
+      .desc     = N_("Enable/disable EPG data for the entry."),
       .off      = offsetof(epggrab_channel_t, enabled),
       .group    = 1
     },
@@ -669,6 +750,7 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_STR,
       .id       = "modid",
       .name     = N_("Module ID"),
+      .desc     = N_("Module ID used to grab EPG data."),
       .get      = epggrab_channel_class_modid_get,
       .set      = epggrab_channel_class_modid_set,
       .opts     = PO_RDONLY | PO_HIDDEN,
@@ -678,6 +760,7 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_STR,
       .id       = "module",
       .name     = N_("Module"),
+      .desc     = N_("Name of the module used to grab EPG data."),
       .get      = epggrab_channel_class_module_get,
       .opts     = PO_RDONLY | PO_NOSAVE,
       .group    = 1
@@ -686,6 +769,7 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_STR,
       .id       = "path",
       .name     = N_("Path"),
+      .desc     = N_("Data path (if applicable)."),
       .get      = epggrab_channel_class_path_get,
       .opts     = PO_RDONLY | PO_NOSAVE,
       .group    = 1
@@ -694,6 +778,8 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_TIME,
       .id       = "updated",
       .name     = N_("Updated"),
+      .desc     = N_("Date the EPG data was last updated (not set for OTA "
+                     "grabbers)."),
       .off      = offsetof(epggrab_channel_t, laststamp),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .group    = 1
@@ -702,6 +788,7 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_STR,
       .id       = "id",
       .name     = N_("ID"),
+      .desc     = N_("EPG data ID."),
       .off      = offsetof(epggrab_channel_t, id),
       .group    = 1
     },
@@ -709,6 +796,7 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_STR,
       .id       = "name",
       .name     = N_("Name"),
+      .desc     = N_("Service name found in EPG data."),
       .off      = offsetof(epggrab_channel_t, name),
       .group    = 1
     },
@@ -716,15 +804,17 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_STR,
       .id       = "names",
       .name     = N_("Names"),
+      .desc     = N_("Additional service names found in EPG data."),
       .get      = epggrab_channel_class_names_get,
       .set      = epggrab_channel_class_names_set,
       .group    = 1
     },
     {
       .type     = PT_S64,
-      .intsplit = CHANNEL_SPLIT,
+      .intextra = CHANNEL_SPLIT,
       .id       = "number",
       .name     = N_("Number"),
+      .desc     = N_("Channel number as defined in EPG data."),
       .off      = offsetof(epggrab_channel_t, lcn),
       .group    = 1
     },
@@ -732,6 +822,7 @@ const idclass_t epggrab_channel_class = {
       .type     = PT_STR,
       .id       = "icon",
       .name     = N_("Icon"),
+      .desc     = N_("Channel icon as defined in EPG data."),
       .off      = offsetof(epggrab_channel_t, icon),
       .group    = 1
     },
@@ -740,6 +831,7 @@ const idclass_t epggrab_channel_class = {
       .islist   = 1,
       .id       = "channels",
       .name     = N_("Channels"),
+      .desc     = N_("Channels EPG data is used by."),
       .set      = epggrab_channel_class_channels_set,
       .get      = epggrab_channel_class_channels_get,
       .list     = channel_class_get_list,
@@ -749,15 +841,31 @@ const idclass_t epggrab_channel_class = {
     {
       .type     = PT_BOOL,
       .id       = "only_one",
-      .name     = N_("Only one auto channel"),
+      .name     = N_("Once per auto channel"),
+      .desc     = N_("Only use this EPG data once when automatically "
+                     "determining what EPG data to set for a channel."),
       .off      = offsetof(epggrab_channel_t, only_one),
       .notify   = epggrab_channel_class_only_one_notify,
       .group    = 1
     },
     {
+      .type     = PT_INT,
+      .islist   = 1,
+      .id       = "update",
+      .name     = N_("Channel update options"),
+      .desc     = N_("Options used when updating channels."),
+      .notify   = epggrab_channel_class_update_notify,
+      .list     = epggrab_channel_class_update_enum,
+      .get      = epggrab_channel_class_update_get,
+      .set      = epggrab_channel_class_update_set,
+      .rend     = epggrab_channel_class_update_rend,
+      .opts     = PO_ADVANCED
+    },
+    {
       .type     = PT_STR,
       .id       = "comment",
       .name     = N_("Comment"),
+      .desc     = N_("Free-form text field, enter whatever you like."),
       .off      = offsetof(epggrab_channel_t, comment),
       .group    = 1
     },
@@ -772,6 +880,7 @@ void
 epggrab_channel_init( void )
 {
   TAILQ_INIT(&epggrab_channel_entries);
+  idclass_register(&epggrab_channel_class);
 }
 
 void

@@ -53,10 +53,10 @@ static void
 api_epg_add_channel ( htsmsg_t *m, channel_t *ch )
 {
   int64_t chnum;
-  char buf[32];
+  char buf[32], ubuf[UUID_HEX_SIZE];
   const char *s;
   htsmsg_add_str(m, "channelName", channel_get_name(ch));
-  htsmsg_add_str(m, "channelUuid", channel_get_suuid(ch));
+  htsmsg_add_str(m, "channelUuid", channel_get_uuid(ch, ubuf));
   if ((chnum = channel_get_number(ch)) >= 0) {
     uint32_t maj = chnum / CHANNEL_SPLIT;
     uint32_t min = chnum % CHANNEL_SPLIT;
@@ -81,6 +81,7 @@ api_epg_entry ( epg_broadcast_t *eb, const char *lang, access_t *perm )
   epg_episode_num_t epnum;
   epg_genre_t *eg;
   dvr_entry_t *de;
+  char ubuf[UUID_HEX_SIZE];
 
   if (!ee || !ch) return NULL;
 
@@ -115,6 +116,25 @@ api_epg_entry ( epg_broadcast_t *eb, const char *lang, access_t *perm )
     htsmsg_add_str(m, "summary", s);
   if ((s = epg_broadcast_get_description(eb, lang)))
     htsmsg_add_str(m, "description", s);
+
+  if (eb->is_new)
+    htsmsg_add_u32(m, "new", eb->is_new);
+  if (eb->is_repeat)
+    htsmsg_add_u32(m, "repeat", eb->is_repeat);
+  if (eb->is_widescreen)
+    htsmsg_add_u32(m, "widescreen", eb->is_widescreen);
+  if (eb->is_deafsigned)
+    htsmsg_add_u32(m, "deafsigned", eb->is_deafsigned);
+  if (eb->is_subtitled)
+    htsmsg_add_u32(m, "subtitled", eb->is_subtitled);
+  if (eb->is_audio_desc)
+    htsmsg_add_u32(m, "audiodesc", eb->is_audio_desc);
+  if (eb->is_hd)
+    htsmsg_add_u32(m, "hd", eb->is_hd);
+  if (eb->lines)
+    htsmsg_add_u32(m, "lines", eb->lines);
+  if (eb->aspect)
+    htsmsg_add_u32(m, "aspect", eb->aspect);
 
   /* Episode info */
   if (ee) {
@@ -170,9 +190,9 @@ api_epg_entry ( epg_broadcast_t *eb, const char *lang, access_t *perm )
       if (de->de_bcast != eb)
         continue;
       if (access_verify_list(perm->aa_dvrcfgs,
-                             idnode_uuid_as_sstr(&de->de_config->dvr_id)))
+                             idnode_uuid_as_str(&de->de_config->dvr_id, ubuf)))
         continue;
-      htsmsg_add_str(m, "dvrUuid", idnode_uuid_as_sstr(&de->de_id));
+      htsmsg_add_str(m, "dvrUuid", idnode_uuid_as_str(&de->de_id, ubuf));
       htsmsg_add_str(m, "dvrState", dvr_entry_schedstatus(de));
       break;
     }
@@ -296,7 +316,9 @@ api_epg_grid
 
   memset(&eq, 0, sizeof(eq));
 
-  eq.lang = lang = access_get_lang(perm, htsmsg_get_str(args, "lang"));
+  lang = access_get_lang(perm, htsmsg_get_str(args, "lang"));
+  if (lang)
+    eq.lang = strdup(lang);
   str = htsmsg_get_str(args, "title");
   if (str)
     eq.stitle = strdup(str);
@@ -442,6 +464,7 @@ api_epg_grid
   pthread_mutex_unlock(&global_lock);
 
   epg_query_free(&eq);
+  free(lang);
 
   /* Build response */
   *resp = htsmsg_create_map();

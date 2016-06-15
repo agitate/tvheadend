@@ -38,6 +38,7 @@ api_mpegts_input_network_list
   mpegts_input_t *mi;
   mpegts_network_t *mn;
   idnode_set_t *is;
+  char ubuf[UUID_HEX_SIZE];
   extern const idclass_t mpegts_input_class;
 
   if (!(uuid = htsmsg_get_str(args, "uuid")))
@@ -57,7 +58,7 @@ api_mpegts_input_network_list
       char buf[256];
       htsmsg_t *e = htsmsg_create_map();
       mn = (mpegts_network_t*)is->is_array[i];
-      htsmsg_add_str(e, "key", idnode_uuid_as_sstr(is->is_array[i]));
+      htsmsg_add_str(e, "key", idnode_uuid_as_str(is->is_array[i], ubuf));
       mn->mn_display_name(mn, buf, sizeof(buf));
       htsmsg_add_str(e, "val", buf);
       htsmsg_add_msg(l, NULL, e);
@@ -127,7 +128,7 @@ api_mpegts_network_create
   if (mn) {
     err = 0;
     *resp = htsmsg_create_map();
-    mn->mn_config_save(mn);
+    idnode_changed(&mn->mn_id);
   } else {
     err = EINVAL;
   }
@@ -150,21 +151,19 @@ api_mpegts_network_scan
   if ((uuids = htsmsg_field_get_list(f))) {
     HTSMSG_FOREACH(f, uuids) {
       if (!(uuid = htsmsg_field_get_str(f))) continue;
-      mn = mpegts_network_find(uuid);
-      if (mn) {
-        pthread_mutex_lock(&global_lock);
-        mpegts_network_scan(mn);
-        pthread_mutex_unlock(&global_lock);
-      }
-    }
-  } else if ((uuid = htsmsg_field_get_str(f))) {
-    mn = mpegts_network_find(uuid);
-    if (mn) {
       pthread_mutex_lock(&global_lock);
-      mpegts_network_scan(mn);
+      mn = mpegts_network_find(uuid);
+      if (mn)
+        mpegts_network_scan(mn);
       pthread_mutex_unlock(&global_lock);
     }
-    else
+  } else if ((uuid = htsmsg_field_get_str(f))) {
+    pthread_mutex_lock(&global_lock);
+    mn = mpegts_network_find(uuid);
+    if (mn)
+      mpegts_network_scan(mn);
+    pthread_mutex_unlock(&global_lock);
+    if (!mn)
       return -ENOENT;
   } else {
     return -EINVAL;
@@ -224,7 +223,7 @@ api_mpegts_network_muxcreate
   if (!(mm = mn->mn_mux_create2(mn, conf)))
     goto exit;
 
-  mm->mm_config_save(mm);
+  idnode_changed(&mm->mm_id);
   err = 0;
 
 exit:
@@ -318,7 +317,7 @@ api_mpegts_mux_sched_create
   if (mms) {
     err = 0;
     *resp = htsmsg_create_map();
-    mpegts_mux_sched_save(mms);
+    idnode_changed(&mms->mms_id);
   } else {
     err = EINVAL;
   }
@@ -380,25 +379,20 @@ api_dvb_scanfile_list
   if (!type)
     return -EINVAL;
 
-  if (!strcasecmp(type, "dvbt"))
-    list = &scanfile_regions_DVBT;
-  else if (!strcasecmp(type, "dvbc"))
-    list = &scanfile_regions_DVBC;
-  else if (!strcasecmp(type, "dvbs"))
-    list = &scanfile_regions_DVBS;
-  else if (!strcasecmp(type, "atsc"))
-    list = &scanfile_regions_ATSC;
-  else
+  list = scanfile_find_region_list(type);
+  if (!list)
     return -EINVAL;
   
   l = htsmsg_create_list();
-  LIST_FOREACH(r, list, sfr_link) {
+  LIST_FOREACH(r, &list->srl_regions, sfr_link) {
     LIST_FOREACH(n, &r->sfr_networks, sfn_link) {
-      if (satpos != INT_MAX && n->sfn_satpos != satpos) continue;
+      if (satpos != INT_MAX &&
+          abs(n->sfn_satpos - satpos) > 2 &&
+          abs(satpos - n->sfn_satpos) > 2) continue;
       e = htsmsg_create_map();
       sprintf(buf, "%s/%s/%s", type, r->sfr_id, n->sfn_id);
       htsmsg_add_str(e, "key", buf);
-      if (list != &scanfile_regions_DVBS) {
+      if (strcmp(list->srl_type, "dvb-s")) {
         sprintf(buf, "%s: %s", r->sfr_name, n->sfn_name);
         htsmsg_add_str(e, "val", buf);
       } else {

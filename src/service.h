@@ -36,6 +36,23 @@ struct tvh_input;
 struct mpegts_apids;
 
 /**
+ * Source information
+ */
+typedef struct source_info {
+  tvh_uuid_t si_adapter_uuid;
+  tvh_uuid_t si_network_uuid;
+  tvh_uuid_t si_mux_uuid;
+  char *si_adapter;
+  char *si_network;
+  char *si_network_type;
+  char *si_satpos;
+  char *si_mux;
+  char *si_provider;
+  char *si_service;
+  int   si_type;
+} source_info_t;
+
+/**
  * Stream, one media component for a service.
  */
 typedef struct elementary_stream {
@@ -64,9 +81,6 @@ typedef struct elementary_stream {
   int8_t es_pid_opened;      /* PID is opened */
 
   int8_t es_cc;             /* Last CC */
-
-  avgstat_t es_cc_errors;
-  avgstat_t es_rate;
 
   int es_peak_presentation_delay; /* Max seen diff. of DTS and PTS */
 
@@ -257,10 +271,12 @@ typedef struct service {
    * Service type
    */
   enum {
-    ST_NONE,
+    ST_UNSET = -1,
+    ST_NONE = 0,
     ST_OTHER,
     ST_SDTV,
     ST_HDTV,
+    ST_UHDTV,
     ST_RADIO
   } s_servicetype;
 
@@ -286,6 +302,7 @@ typedef struct service {
   int s_enabled;
   int s_auto;
   int s_prio;
+  int s_type_user;
 
   LIST_ENTRY(service) s_active_link;
 
@@ -293,8 +310,8 @@ typedef struct service {
 
   int (*s_is_enabled)(struct service *t, int flags);
 
-  void (*s_enlist)(struct service *s, struct tvh_input *ti,
-                   service_instance_list_t *sil, int flags);
+  int (*s_enlist)(struct service *s, struct tvh_input *ti,
+                  service_instance_list_t *sil, int flags, int weight);
 
   int (*s_start_feed)(struct service *s, int instance, int weight, int flags);
 
@@ -302,7 +319,7 @@ typedef struct service {
 
   void (*s_stop_feed)(struct service *t);
 
-  void (*s_config_save)(struct service *t);
+  htsmsg_t *(*s_config_save)(struct service *t, char *filename, size_t fsize);
 
   void (*s_setsourceinfo)(struct service *t, struct source_info *si);
 
@@ -310,7 +327,11 @@ typedef struct service {
 
   void (*s_delete)(struct service *t, int delconf);
 
+  void (*s_unref)(struct service *t);
+
   int (*s_satip_source)(struct service *t);
+
+  void (*s_memoryinfo)(struct service *t, int64_t *size);
 
   /**
    * Channel info
@@ -362,13 +383,13 @@ typedef struct service {
    * it will check if any packets has been parsed. If not the status
    * will be set to TRANSPORT_STATUS_NO_INPUT
    */
-  gtimer_t s_receive_timer;
+  mtimer_t s_receive_timer;
   /**
    * Stream start time
    */
-  int    s_timeout;
-  int    s_grace_delay;
-  time_t s_start_time;
+  int     s_timeout;
+  int     s_grace_delay;
+  int64_t s_start_time;
 
 
   /*********************************************************
@@ -390,12 +411,6 @@ typedef struct service {
    */
   pthread_mutex_t s_stream_mutex;
 
-
-  /**
-   * Condition variable to singal when streaming_status changes
-   * interlocked with s_stream_mutex
-   */
-  pthread_cond_t s_tss_cond;
   /**
    *
    */			   
@@ -436,11 +451,6 @@ typedef struct service {
   elementary_stream_t *s_audio;
 #endif
  
-  /**
-   * Average bitrate
-   */
-  avgstat_t s_rate;
-
   /**
    * Descrambling support
    */
@@ -532,10 +542,11 @@ const char *service_servicetype_txt(service_t *t);
 
 int service_has_audio_or_video(service_t *t);
 int service_is_sdtv(service_t *t);
+int service_is_uhdtv(service_t *t);
 int service_is_hdtv(service_t *t);
 int service_is_radio(service_t *t);
 int service_is_other(service_t *t);
-#define service_is_tv(s) (service_is_hdtv(s) || service_is_sdtv(s))
+#define service_is_tv(s) (service_is_hdtv(s) || service_is_sdtv(s) || service_is_uhdtv(s))
 
 int service_is_encrypted ( service_t *t );
 
@@ -589,7 +600,7 @@ const char *service_nicename(service_t *t);
 
 const char *service_component_nicename(elementary_stream_t *st);
 
-const char *service_adapter_nicename(service_t *t);
+const char *service_adapter_nicename(service_t *t, char *buf, size_t len);
 
 const char *service_tss2text(int flags);
 
@@ -615,6 +626,8 @@ const char *service_get_full_channel_name (service_t *s);
 int64_t     service_get_channel_number (service_t *s);
 const char *service_get_channel_icon (service_t *s);
 const char *service_get_channel_epgid (service_t *s);
+
+void service_memoryinfo (service_t *s, int64_t *size);
 
 void service_mapped (service_t *s);
 

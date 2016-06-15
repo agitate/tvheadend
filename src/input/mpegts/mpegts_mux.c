@@ -30,6 +30,9 @@
 #include <assert.h>
 
 static void mpegts_mux_scan_timeout ( void *p );
+static void mpegts_mux_do_stop ( mpegts_mux_t *mm, int delconf );
+
+
 /* ****************************************************************************
  * Mux instance (input linkage)
  * ***************************************************************************/
@@ -48,9 +51,11 @@ mpegts_mux_instance_delete
 {
   mpegts_mux_instance_t *mmi = (mpegts_mux_instance_t *)tii;
 
+  idnode_save_check(&tii->tii_id, 1);
   idnode_unlink(&tii->tii_id);
   LIST_REMOVE(mmi, mmi_mux_link);
   LIST_REMOVE(tii, tii_input_link);
+  pthread_mutex_destroy(&mmi->tii_stats_mutex);
   free(mmi);
 }
 
@@ -64,6 +69,8 @@ mpegts_mux_instance_create0
     free(mmi);
     return NULL;
   }
+
+  pthread_mutex_init(&mmi->tii_stats_mutex, NULL);
 
   /* Setup links */
   mmi->mmi_mux   = mm;
@@ -94,7 +101,7 @@ mpegts_mux_scan_active
     t = mpegts_input_grace(mi, mm);
   
     /* Setup timeout */
-    gtimer_arm(&mm->mm_scan_timeout, mpegts_mux_scan_timeout, mm, t);
+    mtimer_arm_rel(&mm->mm_scan_timeout, mpegts_mux_scan_timeout, mm, sec2mono(t));
   }
 }
 
@@ -239,6 +246,8 @@ mpegts_mux_instance_start
   LIST_FOREACH(s, &mm->mm_services, s_dvb_mux_link)
     s->s_dvb_check_seen = s->s_dvb_last_seen;
 
+  mm->mm_tsid_checks = 0;
+
   /* Start */
   mi->mi_display_name(mi, buf2, sizeof(buf2));
   tvhinfo("mpegts", "%s - tuning on %s", buf, buf2);
@@ -288,11 +297,13 @@ mpegts_mux_instance_weight ( mpegts_mux_instance_t *mmi )
  * Class definition
  * ***************************************************************************/
 
-static void
-mpegts_mux_class_save ( idnode_t *self )
+static htsmsg_t *
+mpegts_mux_class_save ( idnode_t *self, char *filename, size_t fsize )
 {
   mpegts_mux_t *mm = (mpegts_mux_t*)self;
-  if (mm->mm_config_save) mm->mm_config_save(mm);
+  if (mm->mm_config_save)
+    return mm->mm_config_save(mm, filename, fsize);
+  return NULL;
 }
 
 static void
@@ -355,13 +366,12 @@ mpegts_mux_class_get_network ( void *ptr )
 static const void *
 mpegts_mux_class_get_network_uuid ( void *ptr )
 {
-  static char buf[UUID_HEX_SIZE], *s = buf;
   mpegts_mux_t *mm = ptr;
   if (mm && mm->mm_network)
-    strcpy(buf, idnode_uuid_as_sstr(&mm->mm_network->mn_id) ?: "");
+    idnode_uuid_as_str(&mm->mm_network->mn_id, prop_sbuf);
   else
-    *buf = 0;
-  return &s;
+    prop_sbuf[0] = '\0';
+  return &prop_sbuf_ptr;
 }
 
 static const void *
@@ -389,6 +399,7 @@ scan_result_tab[] = {
  { N_("OK"),           MM_SCAN_OK   },
  { N_("FAIL"),         MM_SCAN_FAIL },
  { N_("OK (partial)"), MM_SCAN_PARTIAL },
+ { N_("IGNORE"),       MM_SCAN_IGNORE },
 };
 
 int
@@ -448,7 +459,22 @@ mpegts_mux_class_enabled_notify ( void *p, const char *lang )
   if (!mm->mm_is_enabled(mm)) {
     mm->mm_stop(mm, 1, SM_CODE_MUX_NOT_ENABLED);
     mpegts_network_scan_mux_cancel(mm, 0);
+    if (mm->mm_enabled == MM_IGNORE) {
+      mpegts_mux_do_stop(mm, 1);
+      mm->mm_scan_result = MM_SCAN_IGNORE;
+    }
   }
+}
+
+static htsmsg_t *
+mpegts_mux_enable_list ( void *o, const char *lang )
+{
+  static const struct strtab tab[] = {
+    { N_("Ignore"),                   MM_IGNORE },
+    { N_("Disable"),                  MM_DISABLE },
+    { N_("Enable"),                   MM_ENABLE },
+  };
+  return strtab2htsmsg(tab, 1, lang);
 }
 
 static htsmsg_t *
@@ -482,36 +508,48 @@ mpegts_mux_ac3_list ( void *o, const char *lang )
   return strtab2htsmsg(tab, 1, lang);
 }
 
+CLASS_DOC(mpegts_mux)
+
 const idclass_t mpegts_mux_class =
 {
   .ic_class      = "mpegts_mux",
-  .ic_caption    = N_("MPEG-TS multiplex"),
+  .ic_caption    = N_("MPEG-TS Multiplex"),
   .ic_event      = "mpegts_mux",
+  .ic_doc        = tvh_doc_mpegts_mux_class,
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_save       = mpegts_mux_class_save,
   .ic_delete     = mpegts_mux_class_delete,
   .ic_get_title  = mpegts_mux_class_get_title,
   .ic_properties = (const property_t[]){
     {
-      .type     = PT_BOOL,
+      .type     = PT_INT,
       .id       = "enabled",
       .name     = N_("Enabled"),
+      .desc     = N_("Enable, disable or ignore the mux. "
+                     "When the mux is marked as ignore, "
+                     "all discovered services are removed."),
       .off      = offsetof(mpegts_mux_t, mm_enabled),
-      .def.i    = 1,
+      .def.i    = MM_ENABLE,
+      .list     = mpegts_mux_enable_list,
       .notify   = mpegts_mux_class_enabled_notify,
+      .opts     = PO_DOC_NLIST
     },
     {
       .type     = PT_INT,
       .id       = "epg",
       .name     = N_("EPG scan"),
+      .desc     = N_("The EPG grabber to use on the mux. "
+                     "Enable (auto) is the recommended value."),
       .off      = offsetof(mpegts_mux_t, mm_epg),
       .def.i    = MM_EPG_ENABLE,
       .list     = mpegts_mux_epg_list,
+      .opts     = PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
       .id       = "network",
       .name     = N_("Network"),
+      .desc     = N_("The network the mux is on."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_mux_class_get_network,
     },
@@ -519,6 +557,7 @@ const idclass_t mpegts_mux_class =
       .type     = PT_STR,
       .id       = "network_uuid",
       .name     = N_("Network UUID"),
+      .desc     = N_("The networks' universally unique identifier (UUID)."),
       .opts     = PO_RDONLY | PO_NOSAVE | PO_HIDDEN | PO_EXPERT,
       .get      = mpegts_mux_class_get_network_uuid,
     },
@@ -526,6 +565,7 @@ const idclass_t mpegts_mux_class =
       .type     = PT_STR,
       .id       = "name",
       .name     = N_("Name"),
+      .desc     = N_("The name (or frequency) the mux is on."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_mux_class_get_name,
     },
@@ -533,6 +573,7 @@ const idclass_t mpegts_mux_class =
       .type     = PT_STR,
       .id       = "pnetwork_name",
       .name     = N_("Provider network name"),
+      .desc     = N_("The provider's network name."),
       .off      = offsetof(mpegts_mux_t, mm_provider_network_name),
       .opts     = PO_RDONLY | PO_HIDDEN | PO_EXPERT,
     },
@@ -540,6 +581,7 @@ const idclass_t mpegts_mux_class =
       .type     = PT_U16,
       .id       = "onid",
       .name     = N_("Original network ID"),
+      .desc     = N_("The provider's network ID."),
       .opts     = PO_RDONLY | PO_ADVANCED,
       .off      = offsetof(mpegts_mux_t, mm_onid),
     },
@@ -547,6 +589,8 @@ const idclass_t mpegts_mux_class =
       .type     = PT_U16,
       .id       = "tsid",
       .name     = N_("Transport stream ID"),
+      .desc     = N_("The transport stream ID of the mux within the "
+                     "network."),
       .opts     = PO_RDONLY | PO_ADVANCED,
       .off      = offsetof(mpegts_mux_t, mm_tsid),
     },
@@ -554,6 +598,7 @@ const idclass_t mpegts_mux_class =
       .type     = PT_STR,
       .id       = "cridauth",
       .name     = N_("CRID authority"),
+      .desc     = N_("The Content reference identifier (CRID) authority."),
       .opts     = PO_RDONLY | PO_HIDDEN | PO_EXPERT,
       .off      = offsetof(mpegts_mux_t, mm_crid_authority),
     },
@@ -561,31 +606,39 @@ const idclass_t mpegts_mux_class =
       .type     = PT_INT,
       .id       = "scan_state",
       .name     = N_("Scan status"),
+      .desc     = N_("The scan state. New muxes will automatically be "
+                     "changed to the PEND state. You can change this to "
+                     "ACTIVE to queue a scan of this mux."),
       .off      = offsetof(mpegts_mux_t, mm_scan_state),
       .set      = mpegts_mux_class_scan_state_set,
       .list     = mpegts_mux_class_scan_state_enum,
-      .opts     = PO_NOSAVE | PO_SORTKEY,
+      .opts     = PO_NOSAVE | PO_SORTKEY | PO_DOC_NLIST,
     },
     {
       .type     = PT_INT,
       .id       = "scan_result",
       .name     = N_("Scan result"),
+      .desc     = N_("The outcome of the last scan performed on this mux."),
       .off      = offsetof(mpegts_mux_t, mm_scan_result),
-      .opts     = PO_RDONLY | PO_SORTKEY,
+      .opts     = PO_RDONLY | PO_SORTKEY | PO_DOC_NLIST,
       .list     = mpegts_mux_class_scan_result_enum,
     },
     {
       .type     = PT_STR,
       .id       = "charset",
       .name     = N_("Character set"),
+      .desc     = N_("The character set used on this mux. You should "
+                     "not have to change this unless channel names, etc "
+                     " appear garbled."),
       .off      = offsetof(mpegts_mux_t, mm_charset),
       .list     = dvb_charset_enum,
-      .opts     = PO_ADVANCED,
+      .opts     = PO_ADVANCED | PO_DOC_NLIST,
     },
     {
       .type     = PT_INT,
       .id       = "num_svc",
       .name     = N_("# Services"),
+      .desc     = N_("The total number of services found on this mux."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_mux_class_get_num_svc,
     },
@@ -593,6 +646,8 @@ const idclass_t mpegts_mux_class =
       .type     = PT_INT,
       .id       = "num_chn",
       .name     = N_("# Channels"),
+      .desc     = N_("The number of services on the mux that are "
+                     "mapped to channels."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_mux_class_get_num_chn,
     },
@@ -600,15 +655,18 @@ const idclass_t mpegts_mux_class =
       .type     = PT_INT,
       .id       = "pmt_06_ac3",
       .name     = N_("AC-3 detection"),
+      .desc     = N_("Use AC-3 detection on the mux."),
       .off      = offsetof(mpegts_mux_t, mm_pmt_ac3),
       .def.i    = MM_AC3_STANDARD,
       .list     = mpegts_mux_ac3_list,
-      .opts     = PO_HIDDEN | PO_EXPERT
+      .opts     = PO_HIDDEN | PO_EXPERT | PO_DOC_NLIST,
     },
     {
       .type     = PT_BOOL,
       .id       = "eit_tsid_nocheck",
       .name     = N_("EIT - skip TSID check"),
+      .desc     = N_("Skip TSID checking. For when providers use invalid "
+                     "Transport Stream IDs."),
       .off      = offsetof(mpegts_mux_t, mm_eit_tsid_nocheck),
       .opts     = PO_HIDDEN | PO_EXPERT
     },
@@ -627,22 +685,12 @@ mpegts_mux_display_name ( mpegts_mux_t *mm, char *buf, size_t len )
            mm->mm_onid, mm->mm_tsid);
 }
 
-void
-mpegts_mux_delete ( mpegts_mux_t *mm, int delconf )
+static void
+mpegts_mux_do_stop ( mpegts_mux_t *mm, int delconf )
 {
   mpegts_mux_instance_t *mmi;
-  mpegts_service_t *s;
   th_subscription_t *ths;
-  char buf[256];
-
-  mpegts_mux_nice_name(mm, buf, sizeof(buf));
-  tvhinfo("mpegts", "%s (%p) - deleting", buf, mm);
-  
-  /* Stop */
-  mm->mm_stop(mm, 1, SM_CODE_ABORTED);
-
-  /* Remove from network */
-  LIST_REMOVE(mm, mm_network_link);
+  mpegts_service_t *s;
 
   /* Cancel scan */
   mpegts_network_scan_queue_del(mm);
@@ -663,24 +711,47 @@ mpegts_mux_delete ( mpegts_mux_t *mm, int delconf )
   }
 
   /* Stop PID timer */
-  gtimer_disarm(&mm->mm_update_pids_timer);
+  mtimer_disarm(&mm->mm_update_pids_timer);
+}
+
+void
+mpegts_mux_delete ( mpegts_mux_t *mm, int delconf )
+{
+  char buf[256];
+
+  idnode_save_check(&mm->mm_id, delconf);
+
+  mpegts_mux_nice_name(mm, buf, sizeof(buf));
+  tvhinfo("mpegts", "%s (%p) - deleting", buf, mm);
+
+  /* Stop */
+  mm->mm_stop(mm, 1, SM_CODE_ABORTED);
+
+  /* Remove from network */
+  LIST_REMOVE(mm, mm_network_link);
+
+  /* Real stop */
+  mpegts_mux_do_stop(mm, delconf);
 
   /* Free memory */
+  idnode_save_check(&mm->mm_id, 1);
   idnode_unlink(&mm->mm_id);
+  free(mm->mm_provider_network_name);
   free(mm->mm_crid_authority);
   free(mm->mm_charset);
   free(mm);
 }
 
-static void
-mpegts_mux_config_save ( mpegts_mux_t *mm )
+static htsmsg_t *
+mpegts_mux_config_save ( mpegts_mux_t *mm, char *filename, size_t fsize )
 {
+  return NULL;
 }
 
 static int
 mpegts_mux_is_enabled ( mpegts_mux_t *mm )
 {
-  return mm->mm_enabled;
+  return mm->mm_enabled == MM_ENABLE;
 }
 
 static int
@@ -785,8 +856,10 @@ mpegts_mux_stop ( mpegts_mux_t *mm, int force, int reason )
         tvhdebug("mpegts", "%s - close PID %04X (%d) [%d/%p]", buf,
                  mp->mp_pid, mp->mp_pid, mps->mps_type, mps->mps_owner);
         RB_REMOVE(&mp->mp_subs, mps, mps_link);
-        if (mps->mps_type & (MPS_SERVICE|MPS_RAW|MPS_ALL))
+        if (mps->mps_type & (MPS_SERVICE|MPS_ALL))
           LIST_REMOVE(mps, mps_svcraw_link);
+        if (mps->mps_type & MPS_RAW)
+          LIST_REMOVE(mps, mps_raw_link);
         free(mps);
       }
     }
@@ -826,7 +899,7 @@ void
 mpegts_mux_update_pids ( mpegts_mux_t *mm )
 {
   if (mm && mm->mm_active)
-    gtimer_arm(&mm->mm_update_pids_timer, mpegts_mux_update_pids_cb, mm, 0);
+    mtimer_arm_rel(&mm->mm_update_pids_timer, mpegts_mux_update_pids_cb, mm, 0);
 }
 
 void
@@ -862,7 +935,7 @@ mpegts_mux_open_table ( mpegts_mux_t *mm, mpegts_table_t *mt, int subscribe )
     mt->mt_subscribed = 1;
     pthread_mutex_unlock(&mm->mm_tables_lock);
     pthread_mutex_lock(&mi->mi_output_lock);
-    mpegts_input_open_pid(mi, mm, mt->mt_pid, mpegts_table_type(mt), mt->mt_weight, mt);
+    mpegts_input_open_pid(mi, mm, mt->mt_pid, mpegts_table_type(mt), mt->mt_weight, mt, 0);
     pthread_mutex_unlock(&mi->mi_output_lock);
     pthread_mutex_lock(&mm->mm_tables_lock);
     mpegts_table_release(mt);
@@ -992,13 +1065,17 @@ mpegts_mux_scan_done ( mpegts_mux_t *mm, const char *buf, int res )
   }
   pthread_mutex_unlock(&mm->mm_tables_lock);
 
+  /* override if all tables were found */
+  if (res < 0 && incomplete <= 0 && total > 2)
+    res = 1;
+
   if (res < 0) {
     /* is threshold 3 missing tables enough? */
     if (incomplete > 0 && total > incomplete && incomplete <= 3) {
       tvhinfo("mpegts", "%s - scan complete (partial - %d/%d tables)", buf, total, incomplete);
       mpegts_network_scan_mux_partial(mm);
     } else {
-      tvhinfo("mpegts", "%s - scan timed out (%d/%d tables)", buf, total, incomplete);
+      tvhwarn("mpegts", "%s - scan timed out (%d/%d tables)", buf, total, incomplete);
       mpegts_network_scan_mux_fail(mm);
     }
   } else if (res) {
@@ -1057,7 +1134,7 @@ again:
   /* Pending tables (another 20s or 30s - bit arbitrary) */
   } else if (q) {
     tvhtrace("mpegts", "%s - scan needs more time", buf);
-    gtimer_arm(&mm->mm_scan_timeout, mpegts_mux_scan_timeout, mm, w ? 30 : 20);
+    mtimer_arm_rel(&mm->mm_scan_timeout, mpegts_mux_scan_timeout, mm, sec2mono(w ? 30 : 20));
     return;
 
   /* Complete */
@@ -1085,8 +1162,8 @@ mpegts_mux_create0
   }
 
   /* Enabled by default */
-  mm->mm_enabled             = 1;
-  mm->mm_epg                 = 1;
+  mm->mm_enabled             = MM_ENABLE;
+  mm->mm_epg                 = MM_EPG_ENABLE;
 
   /* Identification */
   mm->mm_onid                = onid;
@@ -1125,6 +1202,9 @@ mpegts_mux_create0
   if (conf)
     idnode_load(&mm->mm_id, conf);
 
+  if (mm->mm_enabled == MM_IGNORE)
+    mm->mm_scan_result = MM_SCAN_IGNORE;
+
   /* Initial scan */
   if (mm->mm_scan_result == MM_SCAN_NONE || !mn->mn_skipinitscan)
     mpegts_network_scan_queue_add(mm, SUBSCRIPTION_PRIO_SCAN_INIT,
@@ -1142,7 +1222,20 @@ mpegts_mux_create0
 void
 mpegts_mux_save ( mpegts_mux_t *mm, htsmsg_t *c )
 {
-  idnode_save(&mm->mm_id, c);
+  mpegts_service_t *ms;
+  htsmsg_t *root = htsmsg_create_map();
+  htsmsg_t *services = htsmsg_create_map();
+  htsmsg_t *e;
+  char ubuf[UUID_HEX_SIZE];
+
+  idnode_save(&mm->mm_id, root);
+  LIST_FOREACH(ms, &mm->mm_services, s_dvb_mux_link) {
+    e = htsmsg_create_map();
+    service_save((service_t *)ms, e);
+    htsmsg_add_msg(services, idnode_uuid_as_str(&ms->s_id, ubuf), e);
+  }
+  htsmsg_add_msg(root, "services", services);
+  htsmsg_add_msg(c, "config", root);
 }
 
 int
@@ -1158,13 +1251,15 @@ mpegts_mux_set_network_name ( mpegts_mux_t *mm, const char *name )
 int
 mpegts_mux_set_onid ( mpegts_mux_t *mm, uint16_t onid )
 {
-  char buf[256];
   if (onid == mm->mm_onid)
     return 0;
   mm->mm_onid = onid;
-  mpegts_mux_nice_name(mm, buf, sizeof(buf));
-  mm->mm_config_save(mm);
-  idnode_notify_changed(&mm->mm_id);
+  if (tvhtrace_enabled()) {
+    char buf[256];
+    mpegts_mux_nice_name(mm, buf, sizeof(buf));
+    tvhtrace("mpegts", "%s - set onid %04X (%d)", buf, onid, onid);
+  }
+  idnode_changed(&mm->mm_id);
   return 1;
 }
 
@@ -1173,16 +1268,15 @@ mpegts_mux_set_tsid ( mpegts_mux_t *mm, uint16_t tsid, int force )
 {
   if (tsid == mm->mm_tsid)
     return 0;
-  if (!force && mm->mm_tsid)
+  if (!force && mm->mm_tsid != MPEGTS_TSID_NONE)
     return 0;
   mm->mm_tsid = tsid;
-  mm->mm_config_save(mm);
   if (tvhtrace_enabled()) {
     char buf[256];
     mpegts_mux_nice_name(mm, buf, sizeof(buf));
     tvhtrace("mpegts", "%s - set tsid %04X (%d)", buf, tsid, tsid);
   }
-  idnode_notify_changed(&mm->mm_id);
+  idnode_changed(&mm->mm_id);
   return 1;
 }
 
@@ -1192,13 +1286,12 @@ mpegts_mux_set_crid_authority ( mpegts_mux_t *mm, const char *defauth )
   if (defauth && !strcmp(defauth, mm->mm_crid_authority ?: ""))
     return 0;
   tvh_str_update(&mm->mm_crid_authority, defauth);
-  mm->mm_config_save(mm);
   if (tvhtrace_enabled()) {
     char buf[256];
     mpegts_mux_nice_name(mm, buf, sizeof(buf));
     tvhtrace("mpegts", "%s - set crid authority %s", buf, defauth);
   }
-  idnode_notify_changed(&mm->mm_id);
+  idnode_changed(&mm->mm_id);
   return 1;
 }
 
@@ -1298,12 +1391,8 @@ mpegts_mux_tuning_error ( const char *mux_uuid, mpegts_mux_instance_t *mmi_match
 {
   mpegts_mux_t *mm;
   mpegts_mux_instance_t *mmi;
-  struct timespec timeout;
 
-  timeout.tv_sec = 2;
-  timeout.tv_nsec = 0;
-
-  if (!pthread_mutex_timedlock(&global_lock, &timeout)) {
+  if (!tvh_mutex_timedlock(&global_lock, 2000000)) {
     mm = mpegts_mux_find(mux_uuid);
     if (mm) {
       if ((mmi = mm->mm_active) != NULL && mmi == mmi_match)
@@ -1359,6 +1448,31 @@ mpegts_mux_find_pid_ ( mpegts_mux_t *mm, int pid, int create )
     mm->mm_last_mp = mp;
   }
   return mp;
+}
+
+/* **************************************************************************
+ * Misc
+ * *************************************************************************/
+
+int
+mpegts_mux_compare ( mpegts_mux_t *a, mpegts_mux_t *b )
+{
+  int r = uuid_cmp(&a->mm_network->mn_id.in_uuid,
+                   &b->mm_network->mn_id.in_uuid);
+  if (r)
+    return r;
+  if (idnode_is_instance(&a->mm_id, &dvb_mux_dvbs_class) &&
+      idnode_is_instance(&b->mm_id, &dvb_mux_dvbs_class)) {
+    dvb_mux_conf_t *mc1 = &((dvb_mux_t *)a)->lm_tuning;
+    dvb_mux_conf_t *mc2 = &((dvb_mux_t *)b)->lm_tuning;
+    assert(mc1->dmc_fe_type == DVB_TYPE_S);
+    assert(mc2->dmc_fe_type == DVB_TYPE_S);
+    r = (int)mc1->u.dmc_fe_qpsk.polarisation -
+        (int)mc2->u.dmc_fe_qpsk.polarisation;
+    if (r == 0)
+      r = mc1->dmc_fe_freq - mc2->dmc_fe_freq;
+  }
+  return r;
 }
 
 /******************************************************************************

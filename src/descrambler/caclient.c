@@ -37,8 +37,6 @@ const idclass_t *caclient_classes[] = {
 struct caclient_entry_queue caclients;
 static pthread_mutex_t caclients_mutex;
 
-static void caclient_class_save ( idnode_t *in );
-
 static const idclass_t *
 caclient_class_find(const char *name)
 {
@@ -68,7 +66,7 @@ caclient_reindex(void)
   TAILQ_FOREACH(cac, &caclients, cac_link)
     if (cac->cac_save) {
       cac->cac_save = 0;
-      caclient_class_save((idnode_t *)cac);
+      idnode_changed((idnode_t *)cac);
     }
 }
 
@@ -129,7 +127,7 @@ caclient_create
   }
   pthread_mutex_unlock(&caclients_mutex);
   if (save)
-    caclient_class_save((idnode_t *)cac);
+    idnode_changed((idnode_t *)cac);
   cac->cac_conf_changed(cac);
   return cac;
 }
@@ -137,10 +135,13 @@ caclient_create
 static void
 caclient_delete(caclient_t *cac, int delconf)
 {
+  char ubuf[UUID_HEX_SIZE];
+
+  idnode_save_check(&cac->cac_id, delconf);
   cac->cac_enabled = 0;
   cac->cac_conf_changed(cac);
   if (delconf)
-    hts_settings_remove("caclient/%s", idnode_uuid_as_sstr(&cac->cac_id));
+    hts_settings_remove("caclient/%s", idnode_uuid_as_str(&cac->cac_id, ubuf));
   pthread_mutex_lock(&caclients_mutex);
   TAILQ_REMOVE(&caclients, cac, cac_link);
   pthread_mutex_unlock(&caclients_mutex);
@@ -153,14 +154,20 @@ caclient_delete(caclient_t *cac, int delconf)
 }
 
 static void
-caclient_class_save ( idnode_t *in )
+caclient_class_changed ( idnode_t *in )
 {
   caclient_t *cac = (caclient_t *)in;
+  cac->cac_conf_changed(cac);
+}
+
+static htsmsg_t *
+caclient_class_save ( idnode_t *in, char *filename, size_t fsize )
+{
+  char ubuf[UUID_HEX_SIZE];
   htsmsg_t *c = htsmsg_create_map();
   idnode_save(in, c);
-  hts_settings_save(c, "caclient/%s", idnode_uuid_as_sstr(in));
-  htsmsg_destroy(c);
-  cac->cac_conf_changed(cac);
+  snprintf(filename, fsize, "caclient/%s", idnode_uuid_as_str(in, ubuf));
+  return c;
 }
 
 static const char *
@@ -230,12 +237,16 @@ caclient_class_status_get(void *o)
   return &ret;
 }
 
+CLASS_DOC(caclient)
+
 const idclass_t caclient_class =
 {
   .ic_class      = "caclient",
-  .ic_caption    = N_("Conditional access client"),
+  .ic_caption    = N_("Conditional Access Client"),
+  .ic_changed    = caclient_class_changed,
   .ic_save       = caclient_class_save,
   .ic_event      = "caclient",
+  .ic_doc        = tvh_doc_caclient_class,
   .ic_get_title  = caclient_class_get_title,
   .ic_delete     = caclient_class_delete,
   .ic_moveup     = caclient_class_moveup,
@@ -245,7 +256,7 @@ const idclass_t caclient_class =
       .type     = PT_STR,
       .id       = "class",
       .name     = N_("Class"),
-      .opts     = PO_RDONLY | PO_HIDDEN,
+      .opts     = PO_RDONLY | PO_HIDDEN | PO_NOUI,
       .get      = caclient_class_class_get,
       .set      = caclient_class_class_set,
     },
@@ -253,19 +264,21 @@ const idclass_t caclient_class =
       .type     = PT_INT,
       .id       = "index",
       .name     = N_("Index"),
-      .opts     = PO_RDONLY | PO_HIDDEN,
+      .opts     = PO_RDONLY | PO_HIDDEN | PO_NOUI,
       .off      = offsetof(caclient_t, cac_index),
     },
     {
       .type     = PT_BOOL,
       .id       = "enabled",
       .name     = N_("Enabled"),
+      .desc     = N_("Enable/Disable CA client."),
       .off      = offsetof(caclient_t, cac_enabled),
     },
     {
       .type     = PT_STR,
       .id       = "name",
       .name     = N_("Client name"),
+      .desc     = N_("Name of the client."),
       .off      = offsetof(caclient_t, cac_name),
       .notify   = idnode_notify_title_changed,
     },
@@ -273,6 +286,7 @@ const idclass_t caclient_class =
       .type     = PT_STR,
       .id       = "comment",
       .name     = N_("Comment"),
+      .desc     = N_("Free-form text field, enter whatever you like."),
       .off      = offsetof(caclient_t, cac_comment),
     },
     {
@@ -280,7 +294,7 @@ const idclass_t caclient_class =
       .id       = "status",
       .name     = N_("Status"),
       .get      = caclient_class_status_get,
-      .opts     = PO_RDONLY | PO_HIDDEN | PO_NOSAVE,
+      .opts     = PO_RDONLY | PO_HIDDEN | PO_NOSAVE | PO_NOUI,
     },
     { }
   }
@@ -344,12 +358,17 @@ caclient_init(void)
 {
   htsmsg_t *c, *e;
   htsmsg_field_t *f;
+  const idclass_t **r;
 
   pthread_mutex_init(&caclients_mutex, NULL);
   TAILQ_INIT(&caclients);
+  idclass_register(&caclient_class);
 #if ENABLE_TSDEBUG
   tsdebugcw_init();
 #endif
+
+  for (r = caclient_classes; *r; r++)
+    idclass_register(*r);
 
   if (!(c = hts_settings_load("caclient")))
     return;

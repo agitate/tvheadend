@@ -107,7 +107,7 @@ tvheadend.status_subs = function(panel, index)
                 dataIndex: 'channel'
             },
             {
-                width: 200,
+                width: 250,
                 id: 'service',
                 header: _("Service"),
                 dataIndex: 'service'
@@ -173,6 +173,13 @@ tvheadend.status_subs = function(panel, index)
         }
 
         subs = new Ext.grid.GridPanel({
+            tbar: ['->', {
+                text: _('Help'),
+                iconCls: 'help',
+                handler: function() {
+                    new tvheadend.mdhelp('status_subscriptions')
+                }
+            }],
             border: false,
             loadMask: true,
             stripeRows: true,
@@ -262,7 +269,7 @@ tvheadend.status_streams = function(panel, index)
             width: 10,
             actions: [
                 {
-                    iconCls: 'undo',
+                    iconCls: 'clean',
                     qtip: _('Clear statistics'),
                     cb: function(grid, rec, act, row) {
                         var uuid = grid.getStore().getAt(row).data.uuid;
@@ -433,7 +440,7 @@ tvheadend.status_streams = function(panel, index)
             colored: true,
             ceiling: 65535,
             tvh_renderer: function(v, p, record) {
-                var scale = record.get('snr_scale');
+                var scale = record.get('signal_scale');
                 if (scale == 1)
                   return v;
                 if (scale == 2) {
@@ -447,6 +454,13 @@ tvheadend.status_streams = function(panel, index)
         }));
 
         grid = new Ext.grid.GridPanel({
+            tbar: ['->', {
+                text: _('Help'),
+                iconCls: 'help',
+                handler: function() {
+                    new tvheadend.mdhelp('status_stream')
+                }
+            }],
             border: false,
             loadMask: true,
             stripeRows: true,
@@ -476,6 +490,7 @@ tvheadend.status_streams = function(panel, index)
     }
 
     var dpanel = new Ext.Panel({
+        id: 'status_streams',
         border: false,
         header: false,
         layout: 'fit',
@@ -583,6 +598,13 @@ tvheadend.status_conns = function(panel, index) {
             }]);
 
         grid = new Ext.grid.GridPanel({
+            tbar: ['->', {
+                text: _('Help'),
+                iconCls: 'help',
+                handler: function() {
+                    new tvheadend.mdhelp('status_connections')
+                }
+            }],
             border: false,
             loadMask: true,
             stripeRows: true,

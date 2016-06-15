@@ -24,6 +24,7 @@
 #include "settings.h"
 #include "atomic.h"
 #include "access.h"
+#include "atomic.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -36,6 +37,27 @@
 static int timeshift_index = 0;
 
 struct timeshift_conf timeshift_conf;
+
+/*
+ * Packet log
+ */
+void
+timeshift_packet_log0
+  ( const char *source, timeshift_t *ts, streaming_message_t *sm )
+{
+  th_pkt_t *pkt = sm->sm_data;
+  tvhtrace("timeshift",
+           "ts %d pkt %s - stream %d type %c pts %10"PRId64
+           " dts %10"PRId64" dur %10d len %6zu time %14"PRId64,
+           ts->id, source,
+           pkt->pkt_componentindex,
+           pkt_frametype_to_char(pkt->pkt_frametype),
+           ts_rescale(pkt->pkt_pts, 1000000),
+           ts_rescale(pkt->pkt_dts, 1000000),
+           pkt->pkt_duration,
+           pktbuf_len(pkt->pkt_payload),
+           sm->sm_time);
+}
 
 /*
  * Safe values for RAM configuration
@@ -61,6 +83,8 @@ void timeshift_init ( void )
   timeshift_conf.max_period       = 60;                      // Hr (60mins)
   timeshift_conf.max_size         = 10000 * (size_t)1048576; // 10G
 
+  idclass_register(&timeshift_conf_class);
+
   /* Load settings */
   if ((m = hts_settings_load("timeshift/config"))) {
     idnode_load(&timeshift_conf.idnode, m);
@@ -80,18 +104,24 @@ void timeshift_term ( void )
 }
 
 /*
+ * Changed settings
+ */
+static void
+timeshift_conf_class_changed ( idnode_t *self )
+{
+  timeshift_fixup();
+}
+
+/*
  * Save settings
  */
-static void timeshift_conf_class_save ( idnode_t *self )
+static htsmsg_t *
+timeshift_conf_class_save ( idnode_t *self, char *filename, size_t fsize )
 {
-  htsmsg_t *m;
-
-  timeshift_fixup();
-
-  m = htsmsg_create_map();
+  htsmsg_t *m = htsmsg_create_map();
   idnode_save(&timeshift_conf.idnode, m);
-  hts_settings_save(m, "timeshift/config");
-  htsmsg_destroy(m);
+  snprintf(filename, fsize, "timeshift/config");
+  return m;
 }
 
 /*
@@ -136,48 +166,72 @@ timeshift_conf_class_ram_size_set ( void *o, const void *v )
   return 0;
 }
 
+CLASS_DOC(timeshift)
+
 const idclass_t timeshift_conf_class = {
   .ic_snode      = &timeshift_conf.idnode,
   .ic_class      = "timeshift",
   .ic_caption    = N_("Timeshift"),
+  .ic_doc        = tvh_doc_timeshift_class,
   .ic_event      = "timeshift",
   .ic_perm_def   = ACCESS_ADMIN,
+  .ic_changed    = timeshift_conf_class_changed,
   .ic_save       = timeshift_conf_class_save,
   .ic_properties = (const property_t[]){
     {
       .type   = PT_BOOL,
       .id     = "enabled",
       .name   = N_("Enabled"),
+      .desc   = N_("Enable/disable timeshift."),
       .off    = offsetof(timeshift_conf_t, enabled),
     },
     {
       .type   = PT_BOOL,
       .id     = "ondemand",
-      .name   = N_("On-demand"),
+      .name   = N_("On-demand (no first rewind)"),
+      /*.desc   = N_("Use timeshift only on-demand. It is started when the first request "
+                   "to move in the playback time occurs (fast-forward, rewind, goto)."),
+      */
+      .desc   = N_("Only activate timeshift when the client makes the first "
+                   "rewind, fast-forward or pause request. Note, "
+                   "because there is no buffer on the first request "
+                   "rewinding is not possible at that point."),
       .off    = offsetof(timeshift_conf_t, ondemand),
     },
     {
       .type   = PT_STR,
       .id     = "path",
       .name   = N_("Storage path"),
+      .desc   = N_("Path to where the timeshift data will be stored. "
+                   "If nothing is specified this will default to "
+                   "CONF_DIR/timeshift/buffer."),
       .off    = offsetof(timeshift_conf_t, path),
     },
     {
       .type   = PT_U32,
       .id     = "max_period",
       .name   = N_("Maximum period (mins)"),
+      .desc   = N_("The maximum time period that will be buffered for "
+                   "any given (client) subscription."),
       .off    = offsetof(timeshift_conf_t, max_period),
     },
     {
       .type   = PT_BOOL,
       .id     = "unlimited_period",
       .name   = N_("Unlimited time"),
+      .desc   = N_("Allow the timeshift buffer to grow unbounded until "
+                   "your storage media runs out of space. Warning, "
+                   "enabling this option may cause your system to slow "
+                   "down or crash completely!"),
       .off    = offsetof(timeshift_conf_t, unlimited_period),
     },
     {
       .type   = PT_S64,
       .id     = "max_size",
       .name   = N_("Maximum size (MB)"),
+      .desc   = N_("The maximum combined size of all timeshift buffers. "
+                   "If you specify an unlimited period it's highly "
+                   "recommended you specify a value here."),
       .set    = timeshift_conf_class_max_size_set,
       .get    = timeshift_conf_class_max_size_get,
     },
@@ -185,6 +239,10 @@ const idclass_t timeshift_conf_class = {
       .type   = PT_S64,
       .id     = "ram_size",
       .name   = N_("Maximum RAM size (MB)"),
+      .desc   = N_("The maximum RAM (system memory) size for timeshift "
+                   "buffers. When free RAM buffers are available, they "
+                   "are used for timeshift data in preference to using "
+                   "storage."),
       .set    = timeshift_conf_class_ram_size_set,
       .get    = timeshift_conf_class_ram_size_get,
     },
@@ -192,47 +250,47 @@ const idclass_t timeshift_conf_class = {
       .type   = PT_BOOL,
       .id     = "unlimited_size",
       .name   = N_("Unlimited size"),
+      .desc   = N_("Allow the combined size of all timeshift buffers to "
+                   "potentially grow unbounded until your storage media "
+                   "runs out of space."),
       .off    = offsetof(timeshift_conf_t, unlimited_size),
     },
     {
       .type   = PT_BOOL,
       .id     = "ram_only",
       .name   = N_("RAM only"),
+      .desc   = N_("Only use system RAM for timeshift buffers."),
       .off    = offsetof(timeshift_conf_t, ram_only),
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "ram_fit",
+      .name   = N_("Fit to RAM (cut rewind)"),
+      .desc   = N_("If possible, maintain the timeshift data in the server memory only. "
+                   "This may reduce the amount of allowed rewind time."),
+      .off    = offsetof(timeshift_conf_t, ram_fit),
     },
     {}
   }
 };
 
 /*
- * Decode initial time diff
- *
- * Gather some packets and select the lowest pts to identify
- * the correct start. Note that for timeshift, the tsfix
- * stream plugin is applied, so the starting pts should be
- * near zero. If not - it's a bug.
+ * Process a packet
  */
-static void
-timeshift_set_pts_delta ( timeshift_t *ts, int64_t pts )
+
+static int
+timeshift_packet( timeshift_t *ts, streaming_message_t *sm )
 {
-  int i;
-  int64_t smallest = INT64_MAX;
+  th_pkt_t *pkt = sm->sm_data;
+  int64_t time;
 
-  if (pts == PTS_UNSET)
-    return;
-
-  for (i = 0; i < ARRAY_SIZE(ts->pts_val); i++) {
-    int64_t i64 = ts->pts_val[i];
-    if (i64 == PTS_UNSET) {
-      ts->pts_val[i] = pts;
-      break;
-    }
-    if (i64 < smallest)
-      smallest = i64;
-  }
-
-  if (i >= ARRAY_SIZE(ts->pts_val))
-    ts->pts_delta = getmonoclock() - ts_rescale(smallest, 1000000);
+  time = ts_rescale(pkt->pkt_pts, 1000000);
+  if (ts->last_wr_time < time)
+    ts->last_wr_time = time;
+  sm->sm_time = ts->last_wr_time;
+  timeshift_packet_log("wr ", ts, sm);
+  streaming_target_deliver2(&ts->wr_queue.sq_st, sm);
+  return 0;
 }
 
 /*
@@ -241,90 +299,60 @@ timeshift_set_pts_delta ( timeshift_t *ts, int64_t pts )
 static void timeshift_input
   ( void *opaque, streaming_message_t *sm )
 {
-  int exit = 0;
+  int type = sm->sm_type;
   timeshift_t *ts = opaque;
-  th_pkt_t *pkt = sm->sm_data;
+  th_pkt_t *pkt, *pkt2;
 
-  pthread_mutex_lock(&ts->state_mutex);
+  if (ts->exit)
+    return;
 
   /* Control */
-  if (sm->sm_type == SMT_SKIP) {
-    if (ts->state >= TS_LIVE)
-      timeshift_write_skip(ts->rd_pipe.wr, sm->sm_data);
+  if (type == SMT_SKIP) {
+    timeshift_write_skip(ts->rd_pipe.wr, sm->sm_data);
     streaming_msg_free(sm);
-  } else if (sm->sm_type == SMT_SPEED) {
-    if (ts->state >= TS_LIVE)
-      timeshift_write_speed(ts->rd_pipe.wr, sm->sm_code);
+  } else if (type == SMT_SPEED) {
+    timeshift_write_speed(ts->rd_pipe.wr, sm->sm_code);
     streaming_msg_free(sm);
-  }
+  } else {
 
-  else {
-
-    /* Start */
-    if (sm->sm_type == SMT_START && ts->state == TS_INIT) {
-      ts->state  = TS_LIVE;
-    }
-
-    if (sm->sm_type == SMT_PACKET) {
-      tvhtrace("timeshift",
-               "ts %d pkt in  - stream %d type %c pts %10"PRId64
-               " dts %10"PRId64" dur %10d len %zu",
-               ts->id,
-               pkt->pkt_componentindex,
-               pkt_frametype_to_char(pkt->pkt_frametype),
-               ts_rescale(pkt->pkt_pts, 1000000),
-               ts_rescale(pkt->pkt_dts, 1000000),
-               pkt->pkt_duration,
-               pktbuf_len(pkt->pkt_payload));
-    }
-
-    /* Pass-thru */
-    if (ts->state <= TS_LIVE) {
-      if (sm->sm_type == SMT_START) {
-        if (ts->smt_start)
-          streaming_start_unref(ts->smt_start);
-        ts->smt_start = sm->sm_data;
-        atomic_add(&ts->smt_start->ss_refcount, 1);
-      }
-      streaming_target_deliver2(ts->output, streaming_msg_clone(sm));
+    /* Change PTS/DTS offsets */
+    if (ts->packet_mode && ts->start_pts && type == SMT_PACKET) {
+      pkt = sm->sm_data;
+      pkt2 = pkt_copy_shallow(pkt);
+      pkt_ref_dec(pkt);
+      sm->sm_data = pkt2;
+      pkt2->pkt_pts += ts->start_pts;
+      pkt2->pkt_dts += ts->start_pts;
     }
 
     /* Check for exit */
-    if (sm->sm_type == SMT_EXIT ||
-        (sm->sm_type == SMT_STOP && sm->sm_code == 0))
-      exit = 1;
+    else if (type == SMT_EXIT ||
+        (type == SMT_STOP && sm->sm_code != SM_CODE_SOURCE_RECONFIGURED))
+      ts->exit = 1;
 
-    /* Record (one-off) PTS delta */
-    if (sm->sm_type == SMT_PACKET && ts->pts_delta == PTS_UNSET)
-      timeshift_set_pts_delta(ts, pkt->pkt_pts);
+    else if (type == SMT_MPEGTS)
+      ts->packet_mode = 0;
 
-    /* Buffer to disk */
-    if ((ts->state > TS_LIVE) || (!ts->ondemand && (ts->state == TS_LIVE))) {
-      sm->sm_time = getmonoclock();
-      if (sm->sm_type == SMT_PACKET) {
-        tvhtrace("timeshift",
-                 "ts %d pkt buf - stream %d type %c pts %10"PRId64
-                 " dts %10"PRId64" dur %10d len %zu",
-                 ts->id,
-                 pkt->pkt_componentindex,
-                 pkt_frametype_to_char(pkt->pkt_frametype),
-                 ts_rescale(pkt->pkt_pts, 1000000),
-                 ts_rescale(pkt->pkt_dts, 1000000),
-                 pkt->pkt_duration,
-                 pktbuf_len(pkt->pkt_payload));
+    /* Send to the writer thread */
+    if (ts->packet_mode) {
+      sm->sm_time = ts->last_wr_time;
+      if ((type == SMT_PACKET) && !timeshift_packet(ts, sm))
+        goto _exit;
+    } else {
+      if (ts->ref_time == 0) {
+        ts->ref_time = getfastmonoclock();
+        sm->sm_time = 0;
+      } else {
+        sm->sm_time = getfastmonoclock() - ts->ref_time;
       }
-      streaming_target_deliver2(&ts->wr_queue.sq_st, sm);
-    } else
-      streaming_msg_free(sm);
+    }
+    streaming_target_deliver2(&ts->wr_queue.sq_st, sm);
 
     /* Exit/Stop */
-    if (exit) {
+_exit:
+    if (ts->exit)
       timeshift_write_exit(ts->rd_pipe.wr);
-      ts->state = TS_EXIT;
-    }
   }
-
-  pthread_mutex_unlock(&ts->state_mutex);
 }
 
 /**
@@ -345,7 +373,8 @@ timeshift_destroy(streaming_target_t *pad)
   pthread_mutex_lock(&ts->state_mutex);
   sm = streaming_msg_create(SMT_EXIT);
   streaming_target_deliver2(&ts->wr_queue.sq_st, sm);
-  timeshift_write_exit(ts->rd_pipe.wr);
+  if (!ts->exit)
+    timeshift_write_exit(ts->rd_pipe.wr);
   pthread_mutex_unlock(&ts->state_mutex);
 
   /* Wait for all threads */
@@ -361,7 +390,6 @@ timeshift_destroy(streaming_target_t *pad)
   /* Flush files */
   timeshift_filemgr_flush(ts, NULL);
 
-  /* Release SMT_START index */
   if (ts->smt_start)
     streaming_start_unref(ts->smt_start);
 
@@ -380,7 +408,6 @@ streaming_target_t *timeshift_create
   (streaming_target_t *out, time_t max_time)
 {
   timeshift_t *ts = calloc(1, sizeof(timeshift_t));
-  int i;
 
   /* Must hold global lock */
   lock_assert(&global_lock);
@@ -390,15 +417,22 @@ streaming_target_t *timeshift_create
   ts->output     = out;
   ts->path       = NULL;
   ts->max_time   = max_time;
-  ts->state      = TS_INIT;
+  ts->state      = TS_LIVE;
+  ts->exit       = 0;
   ts->full       = 0;
   ts->vididx     = -1;
   ts->id         = timeshift_index;
   ts->ondemand   = timeshift_conf.ondemand;
-  ts->pts_delta  = PTS_UNSET;
-  for (i = 0; i < ARRAY_SIZE(ts->pts_val); i++)
-    ts->pts_val[i] = PTS_UNSET;
-  pthread_mutex_init(&ts->rdwr_mutex, NULL);
+  ts->dobuf      = ts->ondemand ? 0 : 1;
+  ts->packet_mode= 1;
+  ts->last_wr_time = 0;
+  ts->buf_time   = 0;
+  ts->start_pts  = 0;
+  ts->ref_time   = 0;
+  ts->seek.file  = NULL;
+  ts->seek.frame = NULL;
+  ts->ram_segments = 0;
+  ts->file_segments = 0;
   pthread_mutex_init(&ts->state_mutex, NULL);
 
   /* Initialise output */

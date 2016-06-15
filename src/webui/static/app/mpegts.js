@@ -16,7 +16,7 @@ tvheadend.networks = function(panel, index)
         tvheadend.network_builders = new Ext.data.JsonStore({
             url: 'api/mpegts/network/builders',
             root: 'entries',
-            fields: ['class', 'caption', 'props'],
+            fields: ['class', 'caption', 'order', 'groups', 'props'],
             id: 'class',
             autoLoad: true
         });
@@ -61,23 +61,21 @@ tvheadend.networks = function(panel, index)
     }
 
     tvheadend.idnode_grid(panel, {
+        id: 'mpegts_network',
         url: 'api/mpegts/network',
         titleS: _('Network'),
         titleP: _('Networks'),
         iconCls: 'networks',
         tabIndex: index,
-        help: function() {
-            new tvheadend.help(_('Networks'), 'config_networks.html');
-        },
         tbar: [scanButton],
         add: {
             titleS: _('Network'),
             select: {
                 label: _('Type'),
                 store: tvheadend.network_builders,
+                fullRecord: true,
                 displayField: 'caption',
-                valueField: 'class',
-                propField: 'props'
+                valueField: 'class'
             },
             create: {
                 url: 'api/mpegts/network/create'
@@ -101,9 +99,6 @@ tvheadend.muxes = function(panel, index)
         iconCls: 'muxes',
         tabIndex: index,
         hidemode: true,
-        help: function() {
-            new tvheadend.help(_('Muxes'), 'config_muxes.html');
-        },            
         add: {
             titleS: _('Mux'),
             select: {
@@ -126,9 +121,12 @@ tvheadend.muxes = function(panel, index)
                 header: _('Play'),
                 tooltip: _('Play'),
                 renderer: function(v, o, r) {
-                    var title = r.data['name'] + ' / ' + r.data['network'];
-                    return "<a href='play/stream/mux/" + r.id +
-                           "?title=" + encodeURIComponent(title) + "'>" + _("Play") + "</a>";
+                    var title = r.data['name'];
+                    if (r.data['network']) {
+                        if (title) title += ' / ';
+                        title += r.data['network'];
+                    }
+                    return tvheadend.playLink('play/stream/mux/' + r.id, title);
                 }
             }
         ],
@@ -164,11 +162,11 @@ tvheadend.show_service_streams = function(data) {
     function header( ) {
         html += '<table style="font-size:8pt;font-family:monospace;padding:2px"';
         html += '<tr>';
-        html += '<th style="width:50px;font-weight:bold">Index</th>';
-        html += '<th style="width:120px;font-weight:bold">PID</th>';
-        html += '<th style="width:100px;font-weight:bold">Type</th>';
-        html += '<th style="width:75px;font-weight:bold">Language</th>';
-        html += '<th style="width:*;font-weight:bold">Details</th>';
+        html += '<th style="width:50px;font-weight:bold">' + _('Index') + '</th>';
+        html += '<th style="width:120px;font-weight:bold">' + _('PID') + '</th>';
+        html += '<th style="width:100px;font-weight:bold">' + _('Type') + '</th>';
+        html += '<th style="width:75px;font-weight:bold">' + _('Language') + '</th>';
+        html += '<th style="width:*;font-weight:bold">' + _('Details') + '</th>';
         html += '</tr>';
 
     }
@@ -238,14 +236,31 @@ tvheadend.services = function(panel, index)
         var mapButton = {
             name: 'map',
             builder: function() {
+                var m = new Ext.menu.Menu()
+                m.add({
+                    name: 'mapsel',
+                    tooltip: _('Map selected services to channels'),
+                    iconCls: 'clone',
+                    text: _('Map selected services'),
+                });
+                m.add({
+                    name: 'mapall',
+                    tooltip: _('Map all services to channels'),
+                    iconCls: 'clone',
+                    text: _('Map all services'),
+                });
                 return new Ext.Toolbar.Button({
                     tooltip: _('Map services to channels'),
                     iconCls: 'clone',
-                    text: _('Map All'),
+                    text: _('Map services'),
+                    menu: m,
                     disabled: false
                 });
             },
-            callback: tvheadend.service_mapper
+            callback: {
+                mapall: tvheadend.service_mapper_all,
+                mapsel: tvheadend.service_mapper_sel,
+            }
         };
         
         var selected = function(s, abuttons)
@@ -290,6 +305,7 @@ tvheadend.services = function(panel, index)
         conf.selected = null;
     }
     tvheadend.idnode_grid(panel, {
+        id: 'services',
         url: 'api/mpegts/service',
         titleS: _('Service'),
         titleP: _('Services'),
@@ -298,18 +314,18 @@ tvheadend.services = function(panel, index)
         hidemode: true,
         add: false,
         del: true,
-        help: function() {
-            new tvheadend.help(_('Services'), 'config_services.html');
-        },         
         lcol: [
             {
                 width: 50,
                 header: _('Play'),
                 tooltip: _('Play'),
                 renderer: function(v, o, r) {
-                    var title = r.data['svcname'] + ' / ' + r.data['provider'];
-                    return "<a href='play/stream/service/" + r.id +
-                           "?title=" + encodeURIComponent(title) + "'>" + _('Play') + "</a>";
+                    var title = r.data['svcname'];
+                    if (r.data['provider']) {
+                        if (title) title += ' / ';
+                        title += r.data['provider'];
+                    }
+                    return tvheadend.playLink('play/stream/service/' + r.id, title);
                 }
             },
             {
@@ -333,9 +349,6 @@ tvheadend.mux_sched = function(panel, index)
         titleP: _('Mux Schedulers'),
         iconCls: 'muxSchedulers',
         tabIndex: index,
-        help: function() {
-            new tvheadend.help(_('Mux Schedulers'), 'config_muxsched.html');
-        },          
         hidemode: true,
         add: {
             url: 'api/mpegts/mux_sched',

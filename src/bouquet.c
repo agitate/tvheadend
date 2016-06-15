@@ -28,7 +28,7 @@
 typedef struct bouquet_download {
   bouquet_t  *bq;
   download_t  download;
-  gtimer_t    timer;
+  mtimer_t    timer;
 } bouquet_download_t;
 
 bouquet_tree_t bouquets;
@@ -51,13 +51,41 @@ _bq_cmp(const void *a, const void *b)
 /**
  *
  */
+static void
+bouquet_free(bouquet_t *bq)
+{
+  bouquet_download_t *bqd;
+
+  idnode_save_check(&bq->bq_id, 1);
+  idnode_unlink(&bq->bq_id);
+
+  if ((bqd = bq->bq_download) != NULL) {
+    bouquet_download_stop(bqd);
+    download_done(&bqd->download);
+    free(bqd);
+  }
+
+  idnode_set_free(bq->bq_active_services);
+  idnode_set_free(bq->bq_services);
+  htsmsg_destroy(bq->bq_services_waiting);
+  free((char *)bq->bq_chtag_waiting);
+  free(bq->bq_name);
+  free(bq->bq_ext_url);
+  free(bq->bq_src);
+  free(bq->bq_comment);
+  free(bq);
+}
+
+/**
+ *
+ */
 bouquet_t *
 bouquet_create(const char *uuid, htsmsg_t *conf,
                const char *name, const char *src)
 {
   bouquet_t *bq, *bq2;
   bouquet_download_t *bqd;
-  char buf[128];
+  char buf[128], ubuf[UUID_HEX_SIZE];
   int i;
 
   lock_assert(&global_lock);
@@ -66,11 +94,12 @@ bouquet_create(const char *uuid, htsmsg_t *conf,
   bq->bq_services = idnode_set_create(1);
   bq->bq_active_services = idnode_set_create(1);
   bq->bq_ext_url_period = 60;
+  bq->bq_mapencrypted = 1;
 
   if (idnode_insert(&bq->bq_id, uuid, &bouquet_class, 0)) {
     if (uuid)
       tvherror("bouquet", "invalid uuid '%s'", uuid);
-    free(bq);
+    bouquet_free(bq);
     return NULL;
   }
 
@@ -98,7 +127,7 @@ bouquet_create(const char *uuid, htsmsg_t *conf,
       bq->bq_ext_url = NULL;
     } else {
       free(bq->bq_src);
-      snprintf(buf, sizeof(buf), "exturl://%s", idnode_uuid_as_sstr(&bq->bq_id));
+      snprintf(buf, sizeof(buf), "exturl://%s", idnode_uuid_as_str(&bq->bq_id, ubuf));
       bq->bq_src = strdup(buf);
       bq->bq_download = bqd = calloc(1, sizeof(*bqd));
       bqd->bq = bq;
@@ -110,7 +139,11 @@ bouquet_create(const char *uuid, htsmsg_t *conf,
   }
 
   bq2 = RB_INSERT_SORTED(&bouquets, bq, bq_link, _bq_cmp);
-  assert(bq2 == NULL);
+  if (bq2) {
+    tvherror("bouquet", "found duplicate source id: '%s', remove duplicate config", bq->bq_src);
+    bouquet_free(bq);
+    return NULL;
+  }
 
   bq->bq_saveflag = 1;
 
@@ -126,29 +159,12 @@ bouquet_create(const char *uuid, htsmsg_t *conf,
 static void
 bouquet_destroy(bouquet_t *bq)
 {
-  bouquet_download_t *bqd;
-
   if (!bq)
     return;
 
   RB_REMOVE(&bouquets, bq, bq_link);
-  idnode_unlink(&bq->bq_id);
 
-  if ((bqd = bq->bq_download) != NULL) {
-    bouquet_download_stop(bqd);
-    download_done(&bqd->download);
-    free(bqd);
-  }
-
-  idnode_set_free(bq->bq_active_services);
-  idnode_set_free(bq->bq_services);
-  assert(bq->bq_services_waiting == NULL);
-  free((char *)bq->bq_chtag_waiting);
-  free(bq->bq_name);
-  free(bq->bq_ext_url);
-  free(bq->bq_src);
-  free(bq->bq_comment);
-  free(bq);
+  bouquet_free(bq);
 }
 
 /**
@@ -206,7 +222,7 @@ bouquet_find_by_source(const char *name, const char *src, int create)
       tvhwarn("bouquet", "bouquet name '%s' changed to '%s'", bq->bq_name ?: "", name);
       free(bq->bq_name);
       bq->bq_name = strdup(name);
-      bouquet_save(bq, 1);
+      idnode_changed(&bq->bq_id);
     }
     return bq;
   }
@@ -239,7 +255,7 @@ bouquet_tag(bouquet_t *bq, int create)
   ct = channel_tag_find_by_name(buf, create);
   if (ct) {
     bq->bq_chtag_ptr = ct;
-    bouquet_save(bq, 0);
+    idnode_changed(&bq->bq_id);
   }
   return ct;
 }
@@ -272,6 +288,7 @@ bouquet_map_channel(bouquet_t *bq, service_t *t)
     .check_availability = 0,
     .encrypted          = 1,
     .merge_same_name    = 0,
+    .type_tags          = 0,
     .provider_tags      = 0,
     .network_tags       = 0
   };
@@ -286,18 +303,23 @@ bouquet_map_channel(bouquet_t *bq, service_t *t)
     return;
   if (!bq->bq_mapnoname && noname(service_get_channel_name(t)))
     return;
+  if (!bq->bq_mapencrypted && service_is_encrypted(t))
+    return;
   LIST_FOREACH(ilm, &t->s_channels, ilm_in1_link)
     if (((channel_t *)ilm->ilm_in2)->ch_bouquet == bq)
       break;
-  if (!ilm)
+  if (!ilm) {
+    sm_conf.encrypted = bq->bq_mapencrypted;
+    sm_conf.merge_same_name = bq->bq_mapmergename;
+    sm_conf.type_tags = bq->bq_chtag_type_tags;
+    sm_conf.provider_tags = bq->bq_chtag_provider_tags;
+    sm_conf.network_tags = bq->bq_chtag_network_tags;
     ch = service_mapper_process(&sm_conf, t, bq);
-  else
+  } else
     ch = (channel_t *)ilm->ilm_in2;
   if (ch && bq->bq_chtag)
-    if (channel_tag_map(bouquet_tag(bq, 1), ch, ch)) {
-      idnode_notify_changed(&ch->ch_id);
-      channel_save(ch);
-    }
+    if (channel_tag_map(bouquet_tag(bq, 1), ch, ch))
+      idnode_changed(&ch->ch_id);
 }
 
 /*
@@ -462,8 +484,10 @@ bouquet_completed(bouquet_t *bq, uint32_t seen)
   bq->bq_active_services = idnode_set_create(1);
 
 save:
-  if (bq->bq_saveflag)
-    bouquet_save(bq, 1);
+  if (bq->bq_saveflag) {
+    bq->bq_saveflag = 0;
+    idnode_changed(&bq->bq_id);
+  }
 }
 
 /*
@@ -558,34 +582,18 @@ bouquet_get_tag_name(bouquet_t *bq, service_t *t)
 void
 bouquet_delete(bouquet_t *bq)
 {
+  char ubuf[UUID_HEX_SIZE];
   if (bq == NULL) return;
   bq->bq_enabled = 0;
   bouquet_map_to_channels(bq);
   if (!bq->bq_shield) {
-    hts_settings_remove("bouquet/%s", idnode_uuid_as_sstr(&bq->bq_id));
+    hts_settings_remove("bouquet/%s", idnode_uuid_as_str(&bq->bq_id, ubuf));
     bouquet_destroy(bq);
   } else {
     idnode_set_free(bq->bq_services);
     bq->bq_services = idnode_set_create(1);
-    bouquet_save(bq, 1);
+    idnode_changed(&bq->bq_id);
   }
-}
-
-/**
- *
- */
-void
-bouquet_save(bouquet_t *bq, int notify)
-{
-  htsmsg_t *c = htsmsg_create_map();
-  idnode_save(&bq->bq_id, c);
-  hts_settings_save(c, "bouquet/%s", idnode_uuid_as_sstr(&bq->bq_id));
-  if (bq->bq_shield)
-    htsmsg_add_bool(c, "shield", 1);
-  htsmsg_destroy(c);
-  bq->bq_saveflag = 0;
-  if (notify)
-    idnode_notify_changed(&bq->bq_id);
 }
 
 /**
@@ -601,14 +609,40 @@ bouquet_change_comment ( bouquet_t *bq, const char *comment, int replace )
   bq->bq_saveflag = 1;
 }
 
+/*
+ *
+ */
+void
+bouquet_scan ( bouquet_t *bq )
+{
+  void mpegts_mux_bouquet_rescan ( const char *src, const char *extra );
+  void iptv_bouquet_trigger_by_uuid( const char *uuid );
+#if ENABLE_IPTV
+  if (bq->bq_src && strncmp(bq->bq_src, "iptv-network://", 15) == 0)
+    return iptv_bouquet_trigger_by_uuid(bq->bq_src + 15);
+#endif
+  if (bq->bq_src && strncmp(bq->bq_src, "exturl://", 9) == 0)
+    return bouquet_download_trigger(bq);
+  mpegts_mux_bouquet_rescan(bq->bq_src, bq->bq_comment);
+  bq->bq_rescan = 0;
+}
+
 /* **************************************************************************
  * Class definition
  * **************************************************************************/
 
-static void
-bouquet_class_save(idnode_t *self)
+static htsmsg_t *
+bouquet_class_save(idnode_t *self, char *filename, size_t fsize)
 {
-  bouquet_save((bouquet_t *)self, 0);
+  bouquet_t *bq = (bouquet_t *)self;
+  htsmsg_t *c = htsmsg_create_map();
+  char ubuf[UUID_HEX_SIZE];
+  idnode_save(&bq->bq_id, c);
+  snprintf(filename, fsize, "bouquet/%s", idnode_uuid_as_str(&bq->bq_id, ubuf));
+  if (bq->bq_shield)
+    htsmsg_add_bool(c, "shield", 1);
+  bq->bq_saveflag = 0;
+  return c;
 }
 
 static void
@@ -639,36 +673,12 @@ bouquet_class_get_list(void *o, const char *lang)
 }
 
 static void
-bouquet_class_rescan_notify0 ( bouquet_t *bq, const char *lang )
-{
-  void mpegts_mux_bouquet_rescan ( const char *src, const char *extra );
-  void iptv_bouquet_trigger_by_uuid( const char *uuid );
-#if ENABLE_IPTV
-  if (bq->bq_src && strncmp(bq->bq_src, "iptv-network://", 15) == 0)
-    return iptv_bouquet_trigger_by_uuid(bq->bq_src + 15);
-#endif
-  if (bq->bq_src && strncmp(bq->bq_src, "exturl://", 9) == 0)
-    return bouquet_download_trigger(bq);
-  mpegts_mux_bouquet_rescan(bq->bq_src, bq->bq_comment);
-  bq->bq_rescan = 0;
-}
-
-static void
-bouquet_class_rescan_notify ( void *obj, const char *lang )
-{
-  bouquet_t *bq = obj;
-
-  if (bq->bq_rescan)
-    bouquet_class_rescan_notify0(bq, lang);
-}
-
-static void
 bouquet_class_enabled_notify ( void *obj, const char *lang )
 {
   bouquet_t *bq = obj;
 
   if (bq->bq_enabled)
-    bouquet_class_rescan_notify0(bq, lang);
+    bouquet_scan(bq);
   bouquet_map_to_channels(bq);
 }
 
@@ -679,28 +689,68 @@ bouquet_class_maptoch_notify ( void *obj, const char *lang )
 }
 
 static void
-bouquet_class_mapnolcn_notify ( void *obj, const char *lang )
+bouquet_class_lcn_offset_notify ( void *obj, const char *lang )
 {
-  bouquet_t *bq = obj;
-  service_t *t;
-  size_t z;
-
-  if (bq->bq_in_load)
+  if (((bouquet_t *)obj)->bq_in_load)
     return;
-  if (!bq->bq_mapnolcn && bq->bq_enabled && bq->bq_maptoch) {
-    for (z = 0; z < bq->bq_services->is_count; z++) {
-      t = (service_t *)bq->bq_services->is_array[z];
-      if ((bq->bq_only_bq_lcn || service_get_channel_number(t) <= 0) &&
-          bouquet_get_channel_number0(bq, t) <= 0)
-        bouquet_unmap_channel(bq, t);
-    }
-  } else {
-    bouquet_map_to_channels(bq);
-  }
+  bouquet_notify_channels((bouquet_t *)obj);
+}
+
+static idnode_slist_t bouquest_class_mapopt_slist[] = {
+  {
+    .id   = "mapnolcn",
+    .name = N_("Map zero-numbered channels"),
+    .off  = offsetof(bouquet_t, bq_mapnolcn),
+  },
+  {
+    .id   = "mapnoname",
+    .name = N_("Map unnamed channels"),
+    .off  = offsetof(bouquet_t, bq_mapnoname),
+  },
+  {
+    .id   = "mapradio",
+    .name = N_("Map radio channels"),
+    .off  = offsetof(bouquet_t, bq_mapradio),
+  },
+  {
+    .id   = "encrypted",
+    .name = N_("Map encrypted services"),
+    .off  = offsetof(bouquet_t, bq_mapencrypted),
+  },
+  {
+    .id   = "merge_name",
+    .name = N_("Merge same name"),
+    .off  = offsetof(bouquet_t, bq_mapmergename),
+  },
+  {}
+};
+
+static htsmsg_t *
+bouquet_class_mapopt_enum ( void *obj, const char *lang )
+{
+  return idnode_slist_enum(obj, bouquest_class_mapopt_slist, lang);
+}
+
+static const void *
+bouquet_class_mapopt_get ( void *obj )
+{
+  return idnode_slist_get(obj, bouquest_class_mapopt_slist);
+}
+
+static char *
+bouquet_class_mapopt_rend ( void *obj, const char *lang )
+{
+  return idnode_slist_rend(obj, bouquest_class_mapopt_slist, lang);
+}
+
+static int
+bouquet_class_mapopt_set ( void *obj, const void *p )
+{
+  return idnode_slist_set(obj, bouquest_class_mapopt_slist, p);
 }
 
 static void
-bouquet_class_mapnoname_notify ( void *obj, const char *lang )
+bouquet_class_mapopt_notify ( void *obj, const char *lang )
 {
   bouquet_t *bq = obj;
   service_t *t;
@@ -708,35 +758,68 @@ bouquet_class_mapnoname_notify ( void *obj, const char *lang )
 
   if (bq->bq_in_load)
     return;
-  if (!bq->bq_mapnoname && bq->bq_enabled && bq->bq_maptoch) {
+  if (bq->bq_enabled && bq->bq_maptoch) {
     for (z = 0; z < bq->bq_services->is_count; z++) {
       t = (service_t *)bq->bq_services->is_array[z];
-      if (noname(service_get_channel_name(t)))
+      if (!bq->bq_mapradio && service_is_radio(t))
+        bouquet_unmap_channel(bq, t);
+      else if (!bq->bq_mapnoname && noname(service_get_channel_name(t)))
+        bouquet_unmap_channel(bq, t);
+      else if (!bq->bq_mapradio && service_is_radio(t))
+        bouquet_unmap_channel(bq, t);
+      else if (!bq->bq_mapencrypted && service_is_encrypted(t))
         bouquet_unmap_channel(bq, t);
     }
-  } else {
-    bouquet_map_to_channels(bq);
   }
+  bouquet_map_to_channels(bq);
 }
 
-static void
-bouquet_class_mapradio_notify ( void *obj, const char *lang )
-{
-  bouquet_t *bq = obj;
-  service_t *t;
-  size_t z;
+static idnode_slist_t bouquest_class_chtag_slist[] = {
+  {
+    .id   = "bouquet_tag",
+    .name = N_("Create bouquet tag"),
+    .off  = offsetof(bouquet_t, bq_chtag),
+  },
+  {
+    .id   = "type_tags",
+    .name = N_("Create type-based tags"),
+    .off  = offsetof(bouquet_t, bq_chtag_type_tags),
+  },
+  {
+    .id   = "providers_tags",
+    .name = N_("Create provider name tags"),
+    .off  = offsetof(bouquet_t, bq_chtag_provider_tags),
+  },
+  {
+    .id   = "network_tags",
+    .name = N_("Create network name tags"),
+    .off  = offsetof(bouquet_t, bq_chtag_network_tags),
+  },
+  {}
+};
 
-  if (bq->bq_in_load)
-    return;
-  if (!bq->bq_mapradio && bq->bq_enabled && bq->bq_maptoch) {
-    for (z = 0; z < bq->bq_services->is_count; z++) {
-      t = (service_t *)bq->bq_services->is_array[z];
-      if (service_is_radio(t))
-        bouquet_unmap_channel(bq, t);
-    }
-  } else {
-    bouquet_map_to_channels(bq);
-  }
+static htsmsg_t *
+bouquet_class_chtag_enum ( void *obj, const char *lang )
+{
+  return idnode_slist_enum(obj, bouquest_class_chtag_slist, lang);
+}
+
+static const void *
+bouquet_class_chtag_get ( void *obj )
+{
+  return idnode_slist_get(obj, bouquest_class_chtag_slist);
+}
+
+static char *
+bouquet_class_chtag_rend ( void *obj, const char *lang )
+{
+  return idnode_slist_rend(obj, bouquest_class_chtag_slist, lang);
+}
+
+static int
+bouquet_class_chtag_set ( void *obj, const void *p )
+{
+  return idnode_slist_set(obj, bouquest_class_chtag_slist, p);
 }
 
 static void
@@ -762,17 +845,8 @@ bouquet_class_chtag_notify ( void *obj, const char *lang )
       if (ilm)
         channel_tag_unmap((channel_t *)ilm->ilm_in2, ct);
     }
-  } else {
-    bouquet_map_to_channels(bq);
   }
-}
-
-static void
-bouquet_class_lcn_offset_notify ( void *obj, const char *lang )
-{
-  if (((bouquet_t *)obj)->bq_in_load)
-    return;
-  bouquet_notify_channels((bouquet_t *)obj);
+  bouquet_map_to_channels(bq);
 }
 
 static const void *
@@ -782,7 +856,7 @@ bouquet_class_chtag_ref_get ( void *obj )
   bouquet_t *bq = obj;
 
   if (bq->bq_chtag_ptr)
-    buf = idnode_uuid_as_sstr(&bq->bq_chtag_ptr->ct_id);
+    buf = idnode_uuid_as_str(&bq->bq_chtag_ptr->ct_id, prop_sbuf);
   else
     buf = "";
   return &buf;
@@ -819,6 +893,7 @@ bouquet_class_services_get ( void *obj )
   int64_t lcn;
   const char *tag;
   size_t z;
+  char ubuf[UUID_HEX_SIZE];
 
   /* Add all */
   for (z = 0; z < bq->bq_services->is_count; z++) {
@@ -828,7 +903,7 @@ bouquet_class_services_get ( void *obj )
       htsmsg_add_s64(e, "lcn", lcn);
     if ((tag = bouquet_get_tag_name(bq, t)) != NULL)
       htsmsg_add_str(e, "tag", tag);
-    htsmsg_add_msg(m, idnode_uuid_as_sstr(&t->s_id), e);
+    htsmsg_add_msg(m, idnode_uuid_as_str(&t->s_id, ubuf), e);
   }
 
   return m;
@@ -873,9 +948,14 @@ bouquet_class_ext_url_notify ( void *obj, const char *lang )
   bouquet_download_trigger((bouquet_t *)obj);
 }
 
+CLASS_DOC(bouquet)
+PROP_DOC(bouquet_mapping_options)
+PROP_DOC(bouquet_tagging)
+
 const idclass_t bouquet_class = {
   .ic_class      = "bouquet",
-  .ic_caption    = N_("Bouquet"),
+  .ic_caption    = N_("Bouquets"),
+  .ic_doc        = tvh_doc_bouquet_class,
   .ic_event      = "bouquet",
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_save       = bouquet_class_save,
@@ -886,55 +966,47 @@ const idclass_t bouquet_class = {
       .type     = PT_BOOL,
       .id       = "enabled",
       .name     = N_("Enabled"),
+      .desc     = N_("Enable/disable the bouquet."),
       .off      = offsetof(bouquet_t, bq_enabled),
       .notify   = bouquet_class_enabled_notify,
     },
     {
       .type     = PT_BOOL,
-      .id       = "rescan",
-      .name     = N_("Rescan"),
-      .off      = offsetof(bouquet_t, bq_rescan),
-      .notify   = bouquet_class_rescan_notify,
-      .opts     = PO_NOSAVE,
-    },
-    {
-      .type     = PT_BOOL,
       .id       = "maptoch",
       .name     = N_("Auto-Map to channels"),
+      .desc     = N_("Automatically map channels defined within the "
+                     "bouquet."),
       .off      = offsetof(bouquet_t, bq_maptoch),
       .notify   = bouquet_class_maptoch_notify,
     },
     {
-      .type     = PT_BOOL,
-      .id       = "mapnolcn",
-      .name     = N_("Map zero-numbered channels"),
-      .off      = offsetof(bouquet_t, bq_mapnolcn),
-      .notify   = bouquet_class_mapnolcn_notify,
-      .opts     = PO_ADVANCED,
+      .type     = PT_INT,
+      .islist   = 1,
+      .id       = "mapopt",
+      .name     = N_("Channel mapping options"),
+      .desc     = N_("Options to use/used when mapping - see Help for details."),
+      .doc      = prop_doc_bouquet_mapping_options,
+      .notify   = bouquet_class_mapopt_notify,
+      .list     = bouquet_class_mapopt_enum,
+      .get      = bouquet_class_mapopt_get,
+      .set      = bouquet_class_mapopt_set,
+      .rend     = bouquet_class_mapopt_rend,
+      .opts     = PO_ADVANCED | PO_DOC_NLIST,
     },
     {
-      .type     = PT_BOOL,
-      .id       = "mapnoname",
-      .name     = N_("Map unnamed channels"),
-      .off      = offsetof(bouquet_t, bq_mapnoname),
-      .notify   = bouquet_class_mapnoname_notify,
-      .opts     = PO_ADVANCED,
-    },
-    {
-      .type     = PT_BOOL,
-      .id       = "mapradio",
-      .name     = N_("Map radio channels"),
-      .off      = offsetof(bouquet_t, bq_mapradio),
-      .notify   = bouquet_class_mapradio_notify,
-      .opts     = PO_ADVANCED,
-    },
-    {
-      .type     = PT_BOOL,
+      .type     = PT_INT,
+      .islist   = 1,
       .id       = "chtag",
-      .name     = N_("Create tag"),
-      .off      = offsetof(bouquet_t, bq_chtag),
+      .name     = N_("Create tags"),
+      .desc     = N_("Create and link these tags to channels when "
+                     "mapping."),
+      .doc      = prop_doc_bouquet_tagging,
       .notify   = bouquet_class_chtag_notify,
-      .opts     = PO_ADVANCED,
+      .list     = bouquet_class_chtag_enum,
+      .get      = bouquet_class_chtag_get,
+      .set      = bouquet_class_chtag_set,
+      .rend     = bouquet_class_chtag_rend,
+      .opts     = PO_ADVANCED | PO_DOC_NLIST,
     },
     {
       .type     = PT_STR,
@@ -949,12 +1021,14 @@ const idclass_t bouquet_class = {
       .type     = PT_STR,
       .id       = "name",
       .name     = N_("Name"),
+      .desc     = N_("Name of the bouquet."),
       .off      = offsetof(bouquet_t, bq_name),
     },
     {
       .type     = PT_STR,
       .id       = "ext_url",
       .name     = N_("External URL"),
+      .desc     = N_("External URL of the bouquet."),
       .off      = offsetof(bouquet_t, bq_ext_url),
       .opts     = PO_HIDDEN | PO_MULTILINE,
       .notify   = bouquet_class_ext_url_notify,
@@ -963,6 +1037,7 @@ const idclass_t bouquet_class = {
       .type     = PT_BOOL,
       .id       = "ssl_peer_verify",
       .name     = N_("SSL verify peer"),
+      .desc     = N_("Verify the SSL certificate."),
       .off      = offsetof(bouquet_t, bq_ssl_peer_verify),
       .opts     = PO_ADVANCED | PO_HIDDEN | PO_EXPERT,
       .notify   = bouquet_class_ext_url_notify,
@@ -971,6 +1046,7 @@ const idclass_t bouquet_class = {
       .type     = PT_U32,
       .id       = "ext_url_period",
       .name     = N_("Re-fetch period (mins)"),
+      .desc     = N_("Re-fetch the bouquet every x minutes."),
       .off      = offsetof(bouquet_t, bq_ext_url_period),
       .opts     = PO_ADVANCED | PO_HIDDEN,
       .notify   = bouquet_class_ext_url_notify,
@@ -980,6 +1056,7 @@ const idclass_t bouquet_class = {
       .type     = PT_STR,
       .id       = "source",
       .name     = N_("Source"),
+      .desc     = N_("Bouquet source."),
       .off      = offsetof(bouquet_t, bq_src),
       .opts     = PO_RDONLY | PO_ADVANCED,
     },
@@ -988,6 +1065,7 @@ const idclass_t bouquet_class = {
       .islist   = 1,
       .id       = "services",
       .name     = N_("Services"),
+      .desc     = N_("Number of services."),
       .get      = bouquet_class_services_get,
       .set      = bouquet_class_services_set,
       .rend     = bouquet_class_services_rend,
@@ -997,6 +1075,7 @@ const idclass_t bouquet_class = {
       .type     = PT_U32,
       .id       = "services_seen",
       .name     = N_("# Services seen"),
+      .desc     = N_("Total number of services seen."),
       .off      = offsetof(bouquet_t, bq_services_seen),
       .opts     = PO_RDONLY,
     },
@@ -1004,6 +1083,7 @@ const idclass_t bouquet_class = {
       .type     = PT_U32,
       .id       = "services_count",
       .name     = N_("# Services"),
+      .desc     = N_("Total number of services."),
       .get      = bouquet_class_services_count_get,
       .opts     = PO_RDONLY | PO_NOSAVE,
     },
@@ -1011,12 +1091,15 @@ const idclass_t bouquet_class = {
       .type     = PT_STR,
       .id       = "comment",
       .name     = N_("Comment"),
+      .desc     = N_("Free-form text field, enter whatever you like."),
       .off      = offsetof(bouquet_t, bq_comment),
     },
     {
       .type     = PT_U32,
       .id       = "lcn_off",
       .name     = N_("Channel number offset"),
+      .desc     = N_("Offset the mapped channel numbers by x "
+                     "(value here + channel number)."),
       .off      = offsetof(bouquet_t, bq_lcn_offset),
       .notify   = bouquet_class_lcn_offset_notify,
       .opts     = PO_ADVANCED
@@ -1035,8 +1118,8 @@ bouquet_download_trigger0(void *aux)
   bouquet_t *bq = bqd->bq;
 
   download_start(&bqd->download, bq->bq_ext_url, bqd);
-  gtimer_arm(&bqd->timer, bouquet_download_trigger0, bqd,
-             MAX(1, bq->bq_ext_url_period) * 60);
+  mtimer_arm_rel(&bqd->timer, bouquet_download_trigger0, bqd,
+                 sec2mono(MAX(1, bq->bq_ext_url_period) * 60));
 }
 
 static void
@@ -1053,7 +1136,7 @@ static void
 bouquet_download_stop(void *aux)
 {
   bouquet_download_t *bqd = aux;
-  gtimer_disarm(&bqd->timer);
+  mtimer_disarm(&bqd->timer);
 }
 
 static int
@@ -1135,13 +1218,15 @@ bouquet_init(void)
   bouquet_t *bq;
 
   RB_INIT(&bouquets);
+  idclass_register(&bouquet_class);
 
   /* Load */
   if ((c = hts_settings_load("bouquet")) != NULL) {
     HTSMSG_FOREACH(f, c) {
       if (!(m = htsmsg_field_get_map(f))) continue;
       bq = bouquet_create(f->hmf_name, m, NULL, NULL);
-      bq->bq_saveflag = 0;
+      if (bq)
+        bq->bq_saveflag = 0;
     }
     htsmsg_destroy(c);
   }

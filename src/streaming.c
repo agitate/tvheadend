@@ -55,11 +55,11 @@ streaming_message_data_size(streaming_message_t *sm)
   if (sm->sm_type == SMT_PACKET) {
     th_pkt_t *pkt = sm->sm_data;
     if (pkt && pkt->pkt_payload)
-      return pkt->pkt_payload->pb_size;
+      return pktbuf_len(pkt->pkt_payload);
   } else if (sm->sm_type == SMT_MPEGTS) {
     pktbuf_t *pkt_payload = sm->sm_data;
     if (pkt_payload)
-      return pkt_payload->pb_size;
+      return pktbuf_len(pkt_payload);
   }
   return 0;
 }
@@ -82,7 +82,7 @@ streaming_queue_deliver(void *opauqe, streaming_message_t *sm)
     sq->sq_size += streaming_message_data_size(sm);
   }
 
-  pthread_cond_signal(&sq->sq_cond);
+  tvh_cond_signal(&sq->sq_cond, 0);
   pthread_mutex_unlock(&sq->sq_mutex);
 }
 
@@ -105,7 +105,7 @@ streaming_queue_init(streaming_queue_t *sq, int reject_filter, size_t maxsize)
   streaming_target_init(&sq->sq_st, streaming_queue_deliver, sq, reject_filter);
 
   pthread_mutex_init(&sq->sq_mutex, NULL);
-  pthread_cond_init(&sq->sq_cond, NULL);
+  tvh_cond_init(&sq->sq_cond);
   TAILQ_INIT(&sq->sq_queue);
 
   sq->sq_maxsize = maxsize;
@@ -121,7 +121,7 @@ streaming_queue_deinit(streaming_queue_t *sq)
   sq->sq_size = 0;
   streaming_queue_clear(&sq->sq_queue);
   pthread_mutex_destroy(&sq->sq_mutex);
-  pthread_cond_destroy(&sq->sq_cond);
+  tvh_cond_destroy(&sq->sq_cond);
 }
 
 /**
@@ -247,7 +247,7 @@ streaming_msg_clone(streaming_message_t *src)
 
   case SMT_START:
     ss = dst->sm_data = src->sm_data;
-    atomic_add(&ss->ss_refcount, 1);
+    streaming_start_ref(ss);
     break;
 
   case SMT_SKIP:
@@ -424,6 +424,8 @@ streaming_code2txt(int code)
     return N_("User limit reached");
   case SM_CODE_WEAK_STREAM:
     return N_("Weak stream");
+  case SM_CODE_USER_REQUEST:
+    return N_("User request");
 
   case SM_CODE_NO_FREE_ADAPTER:
     return N_("No free adapter");
@@ -443,6 +445,8 @@ streaming_code2txt(int code)
     return N_("No service assigned to channel");
   case SM_CODE_NO_ADAPTERS:
     return N_("No assigned adapters");
+  case SM_CODE_INVALID_SERVICE:
+    return N_("Invalid service");
 
   case SM_CODE_ABORTED:
     return N_("Aborted by user");

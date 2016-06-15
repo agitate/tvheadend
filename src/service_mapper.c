@@ -41,30 +41,11 @@ typedef struct service_mapper_item {
 } service_mapper_item_t;
 
 static service_mapper_status_t service_mapper_stat; 
-static pthread_cond_t          service_mapper_cond;
+static tvh_cond_t              service_mapper_cond;
 static TAILQ_HEAD(, service_mapper_item) service_mapper_queue;
+service_mapper_t               service_mapper_conf;
 
 static void *service_mapper_thread ( void *p );
-
-/**
- * Initialise
- */
-pthread_t service_mapper_tid;
-
-void
-service_mapper_init ( void )
-{
-  TAILQ_INIT(&service_mapper_queue);
-  pthread_cond_init(&service_mapper_cond, NULL);
-  tvhthread_create(&service_mapper_tid, NULL, service_mapper_thread, NULL, "svcmap");
-}
-
-void
-service_mapper_done ( void )
-{
-  pthread_cond_signal(&service_mapper_cond);
-  pthread_join(service_mapper_tid, NULL);
-}
 
 /*
  * Get status
@@ -84,6 +65,7 @@ service_mapper_start ( const service_mapper_conf_t *conf, htsmsg_t *uuids )
   int e, tr, qd = 0;
   service_mapper_item_t *smi;
   service_t *s;
+  char ubuf[UUID_HEX_SIZE];
 
   /* Reset stat counters */
   if (TAILQ_EMPTY(&service_mapper_queue))
@@ -94,7 +76,7 @@ service_mapper_start ( const service_mapper_conf_t *conf, htsmsg_t *uuids )
     if (uuids) {
       htsmsg_field_t *f;
       const char *str;
-      const char *uuid = idnode_uuid_as_sstr(&s->s_id);
+      const char *uuid = idnode_uuid_as_str(&s->s_id, ubuf);
       HTSMSG_FOREACH(f, uuids) {
         if (!(str = htsmsg_field_get_str(f))) continue;
         if (!strcmp(str, uuid)) break;
@@ -102,7 +84,7 @@ service_mapper_start ( const service_mapper_conf_t *conf, htsmsg_t *uuids )
       if (!f) continue;
     }
     tvhtrace("service_mapper", "check service %s (%s)",
-             s->s_nicename, idnode_uuid_as_sstr(&s->s_id));
+             s->s_nicename, idnode_uuid_as_str(&s->s_id, ubuf));
 
     /* Already mapped (or in progress) */
     if (s->s_sm_onqueue) continue;
@@ -150,7 +132,7 @@ service_mapper_start ( const service_mapper_conf_t *conf, htsmsg_t *uuids )
   api_service_mapper_notify();
 
   /* Signal */
-  if (qd) pthread_cond_signal(&service_mapper_cond);
+  if (qd) tvh_cond_signal(&service_mapper_cond, 0);
 }
 
 /*
@@ -255,14 +237,16 @@ service_mapper_process
     service_mapper_link(s, chn, chn);
 
     /* Type tags */
-    if (service_is_hdtv(s)) {
-      channel_tag_map(channel_tag_find_by_name("TV channels", 1), chn, chn);
-      channel_tag_map(channel_tag_find_by_name("HDTV", 1), chn, chn);
-    } else if (service_is_sdtv(s)) {
-      channel_tag_map(channel_tag_find_by_name("TV channels", 1), chn, chn);
-      channel_tag_map(channel_tag_find_by_name("SDTV", 1), chn, chn);
-    } else if (service_is_radio(s)) {
-      channel_tag_map(channel_tag_find_by_name("Radio", 1), chn, chn);
+    if (conf->type_tags) {
+      if (service_is_hdtv(s)) {
+        channel_tag_map(channel_tag_find_by_name("TV channels", 1), chn, chn);
+        channel_tag_map(channel_tag_find_by_name("HDTV", 1), chn, chn);
+      } else if (service_is_sdtv(s)) {
+        channel_tag_map(channel_tag_find_by_name("TV channels", 1), chn, chn);
+        channel_tag_map(channel_tag_find_by_name("SDTV", 1), chn, chn);
+      } else if (service_is_radio(s)) {
+        channel_tag_map(channel_tag_find_by_name("Radio", 1), chn, chn);
+      }
     }
 
     /* Custom tags */
@@ -284,8 +268,7 @@ service_mapper_process
     }
 
     /* save */
-    idnode_notify_changed(&chn->ch_id);
-    channel_save(chn);
+    idnode_changed(&chn->ch_id);
   }
   if (!bq) {
     service_mapper_stat.ok++;
@@ -321,7 +304,7 @@ service_mapper_thread ( void *aux )
 
   pthread_mutex_lock(&global_lock);
 
-  while (tvheadend_running) {
+  while (tvheadend_is_running()) {
     
     /* Wait for work */
     while (!(smi = TAILQ_FIRST(&service_mapper_queue))) {
@@ -329,11 +312,11 @@ service_mapper_thread ( void *aux )
         working = 0;
         tvhinfo("service_mapper", "idle");
       }
-      pthread_cond_wait(&service_mapper_cond, &global_lock);
-      if (!tvheadend_running)
+      tvh_cond_wait(&service_mapper_cond, &global_lock);
+      if (!tvheadend_is_running())
         break;
     }
-    if (!tvheadend_running)
+    if (!tvheadend_is_running())
       break;
     s = smi->s;
     service_mapper_remove(s);
@@ -367,15 +350,15 @@ service_mapper_thread ( void *aux )
     /* Wait */
     run = 1;
     pthread_mutex_lock(&sq->sq_mutex);
-    while(tvheadend_running && run) {
+    while(tvheadend_is_running() && run) {
 
       /* Wait for message */
       while((sm = TAILQ_FIRST(&sq->sq_queue)) == NULL) {
-        pthread_cond_wait(&sq->sq_cond, &sq->sq_mutex);
-        if (!tvheadend_running)
+        tvh_cond_wait(&sq->sq_cond, &sq->sq_mutex);
+        if (!tvheadend_is_running())
           break;
       }
-      if (!tvheadend_running)
+      if (!tvheadend_is_running())
         break;
 
       streaming_queue_remove(sq, sm);
@@ -399,7 +382,7 @@ service_mapper_thread ( void *aux )
       streaming_msg_free(sm);
       pthread_mutex_lock(&sq->sq_mutex);
     }
-    if (!tvheadend_running)
+    if (!tvheadend_is_running())
       break;
 
     streaming_queue_clear(&sq->sq_queue);
@@ -409,7 +392,7 @@ service_mapper_thread ( void *aux )
     subscription_unsubscribe(sub, UNSUBSCRIBE_FINAL);
 
     if(err) {
-      tvhinfo("service_mapper", "%s: failed [err %s]", s->s_nicename, err);
+      tvhinfo("service_mapper", "%s: failed [reason: %s]", s->s_nicename, err);
       service_mapper_stat.fail++;
     } else
       service_mapper_process(&smi->conf, s, NULL);
@@ -432,4 +415,173 @@ service_mapper_reset_stats (void)
   service_mapper_stat.ignore = 0;
   service_mapper_stat.fail   = 0;
   service_mapper_stat.active = NULL;
+}
+
+/*
+ * Save settings
+ */
+static htsmsg_t *
+service_mapper_conf_class_save ( idnode_t *self, char *filename, size_t fsize )
+{
+  htsmsg_t *m;
+
+  m = htsmsg_create_map();
+  idnode_save(&service_mapper_conf.idnode, m);
+  snprintf(filename, fsize, "service_mapper/config");
+
+  if (!htsmsg_is_empty(service_mapper_conf.services))
+    service_mapper_start(&service_mapper_conf.d, service_mapper_conf.services);
+  htsmsg_destroy(service_mapper_conf.services);
+  service_mapper_conf.services = NULL;
+
+  return m;
+}
+
+/*
+ * Class
+ */
+
+static const void *
+service_mapper_services_get ( void *obj )
+{
+  return NULL;
+}
+
+static char *
+service_mapper_services_rend ( void *obj, const char *lang )
+{
+  return strdup("");
+}
+
+static int
+service_mapper_services_set ( void *obj, const void *p )
+{
+  service_mapper_t *sm = obj;
+  htsmsg_destroy(sm->services);
+  sm->services = htsmsg_copy((htsmsg_t *)p);
+  return 1;
+}
+
+static htsmsg_t *
+service_mapper_services_enum ( void *obj, const char *lang )
+{
+  htsmsg_t *e, *m = htsmsg_create_map();
+  htsmsg_add_str(m, "type",  "api");
+  htsmsg_add_str(m, "uri",   "service/list");
+  htsmsg_add_str(m, "event", "service");
+  e = htsmsg_create_map();
+  htsmsg_add_bool(e, "enum", 1);
+  htsmsg_add_msg(m, "params", e);
+  return m;
+}
+
+CLASS_DOC(service_mapper)
+
+static const idclass_t service_mapper_conf_class = {
+  .ic_snode      = &service_mapper_conf.idnode,
+  .ic_class      = "service_mapper",
+  .ic_caption    = N_("Service Mapping (Map services to channels)"),
+  .ic_doc        = tvh_doc_service_mapper_class,
+  .ic_event      = "service_mapper",
+  .ic_perm_def   = ACCESS_ADMIN,
+  .ic_save       = service_mapper_conf_class_save,
+  .ic_properties = (const property_t[]){
+    {
+      .type   = PT_STR,
+      .islist = 1,
+      .id     = "services",
+      .name   = N_("Services"),
+      .desc   = N_("Select/Selected services to map."),
+      .get    = service_mapper_services_get,
+      .set    = service_mapper_services_set,
+      .list   = service_mapper_services_enum,
+      .rend   = service_mapper_services_rend
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "check_availability",
+      .name   = N_("Check availability"),
+      .desc   = N_("Check service availability (add live services "
+                   "only)."),
+      .off    = offsetof(service_mapper_t, d.check_availability),
+      .opts   = PO_ADVANCED
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "encrypted",
+      .name   = N_("Map encrypted services"),
+      .desc   = N_("Ignore encryption flag, include encrypted services "
+                   "anyway."),
+      .off    = offsetof(service_mapper_t, d.encrypted),
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "merge_same_name",
+      .name   = N_("Merge same name"),
+      .desc   = N_("Merge services with the same name to one channel."),
+      .off    = offsetof(service_mapper_t, d.merge_same_name),
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "type_tags",
+      .name   = N_("Create type-based tags"),
+      .desc   = N_("Create SDTV/HDTV/Radio tags."),
+      .off    = offsetof(service_mapper_t, d.type_tags),
+      .opts   = PO_ADVANCED
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "provider_tags",
+      .name   = N_("Create provider name tags"),
+      .desc   = N_("Create a provider name tag."),
+      .off    = offsetof(service_mapper_t, d.provider_tags),
+      .opts   = PO_ADVANCED
+    },
+    {
+      .type   = PT_BOOL,
+      .id     = "network_tags",
+      .name   = N_("Create network name tags"),
+      .desc   = N_("Create network name tags (set by provider)."),
+      .off    = offsetof(service_mapper_t, d.network_tags),
+      .opts   = PO_ADVANCED
+    },
+    {}
+  }
+};
+
+/*
+ *
+ */
+
+pthread_t service_mapper_tid;
+
+void service_mapper_init ( void )
+{
+  htsmsg_t *m;
+
+  TAILQ_INIT(&service_mapper_queue);
+  idclass_register(&service_mapper_conf_class);
+  tvh_cond_init(&service_mapper_cond);
+  tvhthread_create(&service_mapper_tid, NULL, service_mapper_thread, NULL, "svcmap");
+
+  /* Defaults */
+  memset(&service_mapper_conf, 0, sizeof(service_mapper_conf));
+  service_mapper_conf.idnode.in_class = &service_mapper_conf_class;
+  service_mapper_conf.d.type_tags = 1;
+  service_mapper_conf.d.encrypted = 1;
+
+  /* Load settings */
+  if ((m = hts_settings_load("service_mapper/config"))) {
+    idnode_load(&service_mapper_conf.idnode, m);
+    htsmsg_destroy(m);
+  }
+}
+
+
+void service_mapper_done ( void )
+{
+  tvh_cond_signal(&service_mapper_cond, 0);
+  pthread_join(service_mapper_tid, NULL);
+  htsmsg_destroy(service_mapper_conf.services);
+  service_mapper_conf.services = NULL;
 }

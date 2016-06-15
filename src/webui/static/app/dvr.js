@@ -26,37 +26,51 @@ tvheadend.dvrDetails = function(uuid) {
         var content = '';
         var but;
 
-        if (chicon != null && chicon.length > 0)
+        if (chicon != null && chicon.length > 0) {
             content += '<img class="x-epg-chicon" src="' + chicon + '">';
+        } else {
+            chicon = null;
+        }
+
+        if (chicon)
+            content += '<div class="x-epg-left">';
 
         if (duplicate)
-            content += '<div class="x-epg-meta"><font color="red"><div class="x-epg-prefix">' + _('Will be skipped') + '<br>' + _('because it is a rerun of:') + '</div>' + tvheadend.niceDate(duplicate * 1000) + '</font></div>';
+            content += '<div class="x-epg-meta"><font color="red"><span class="x-epg-prefix">' + _('Will be skipped') + '<br>' + _('because it is a rerun of:') + '</span>' + tvheadend.niceDate(duplicate * 1000) + '</font></div>';
 
         if (title)
-          content += '<div class="x-epg-title">' + title + '</div>';
+            content += '<div class="x-epg-title">' + title + '</div>';
         if (subtitle)
             content += '<div class="x-epg-title">' + subtitle + '</div>';
         if (episode)
-          content += '<div class="x-epg-title">' + episode + '</div>';
+            content += '<div class="x-epg-title">' + episode + '</div>';
         if (start_real)
-          content += '<div class="x-epg-time"><div class="x-epg-prefix">' + _('Scheduled Start Time') + ':</div> ' + tvheadend.niceDate(start_real * 1000) + '</div>';
+            content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('Scheduled Start Time') + ':</span><span class="x-epg-body">' + tvheadend.niceDate(start_real * 1000) + '</span></div>';
         if (stop_real)
-          content += '<div class="x-epg-time"><div class="x-epg-prefix">' + _('Scheduled Stop Time') + ':</div> ' + tvheadend.niceDate(stop_real * 1000) + '</div>';
+            content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('Scheduled Stop Time') + ':</span><span class="x-epg-body">' + tvheadend.niceDate(stop_real * 1000) + '</span></div>';
         if (duration)
-          content += '<div class="x-epg-time"><div class="x-epg-prefix">' + _('Duration') + ':</div> ' + parseInt(duration / 60) + ' ' + _('min') + '</div>';
-        if (desc)
-          content += '<div class="x-epg-desc">' + desc + '</div>';
-        content += '<hr>';
+            content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('Duration') + ':</span><span class="x-epg-body">' + parseInt(duration / 60) + ' ' + _('min') + '</span></div>';
+        if (chicon) {
+            content += '</div>'; /* x-epg-left */
+            content += '<div class="x-epg-bottom">';
+        }
+        content += '<hr class="x-epg-hr"/>';
+        if (desc) {
+            content += '<div class="x-epg-desc">' + desc + '</div>';
+            content += '<hr class="x-epg-hr"/>';
+        }
         if (status)
-          content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Status') + ':</div> ' + status + '</div>';
+            content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Status') + ':</span><span class="x-epg-body">' + status + '</span></div>';
         if (filesize)
-          content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('File size') + ':</div> ' + parseInt(filesize / 1000000) + ' MB</div>';
+            content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('File size') + ':</span><span class="x-epg-body">' + parseInt(filesize / 1000000) + ' MB</span></div>';
         if (comment)
-          content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Comment') + ':</div> ' + comment + '</div>';
+            content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Comment') + ':</span><span class="x-epg-body">' + comment + '</span></div>';
         if (autorec_caption)
-          content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Autorec') + ':</div> ' + autorec_caption + '</div>';
+            content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Autorec') + ':</span><span class="x-epg-body">' + autorec_caption + '</span></div>';
         if (timerec_caption)
-          content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Time Scheduler') + ':</div> ' + timerec_caption + '</div>';
+            content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Time Scheduler') + ':</span><span class="x-epg-body">' + timerec_caption + '</span></div>';
+        if (chicon)
+            content += '</div>'; /* x-epg-bottom */
 
         var buttons = [];
 
@@ -304,10 +318,7 @@ tvheadend.dvr_upcoming = function(panel, index) {
         lcol: [actions],
         tbar: [stopButton, abortButton],
         selected: selected,
-        beforeedit: beforeedit,
-        help: function() {
-            new tvheadend.help(_('DVR - Upcoming/Current Recordings'), 'dvr_upcoming.html');
-        }
+        beforeedit: beforeedit
     });
 
     return panel;
@@ -368,11 +379,41 @@ tvheadend.dvr_finished = function(panel, index) {
         }
     };
 
+    var moveButton = {
+        name: 'move',
+        builder: function() {
+            return new Ext.Toolbar.Button({
+                tooltip: _('Mark the selected recording as failed'),
+                iconCls: 'movetofailed',
+                text: _('Move to failed'),
+                disabled: true
+            });
+        },
+        callback: function(conf, e, store, select) {
+            var r = select.getSelections();
+            if (r && r.length > 0) {
+                var uuids = [];
+                for (var i = 0; i < r.length; i++)
+                    uuids.push(r[i].id);
+                tvheadend.Ajax({
+                    url: 'api/dvr/entry/move/failed',
+                    params: {
+                        uuid: Ext.encode(uuids)
+                    },
+                    success: function(d) {
+                        store.reload();
+                    }
+                });
+            }
+        }
+    };
+
     function selected(s, abuttons) {
         var r = s.getSelections();
         var b = r.length > 0 && r[0].data.filesize > 0;
         abuttons.download.setDisabled(!b);
         abuttons.rerecord.setDisabled(!b);
+        abuttons.move.setDisabled(!b);
     }
 
     tvheadend.idnode_grid(panel, {
@@ -410,15 +451,11 @@ tvheadend.dvr_finished = function(panel, index) {
                     var title = r.data['disp_title'];
                     if (r.data['episode'])
                         title += ' / ' + r.data['episode'];
-                    return '<a href="play/dvrfile/' + r.id +
-                           '?title=' + encodeURIComponent(title) + '">' + _('Play') + '</a>';
+                    return tvheadend.playLink('play/dvrfile/' + r.id, title);
                 }
             }],
-        tbar: [downloadButton, rerecordButton],
-        selected: selected,
-        help: function() {
-            new tvheadend.help(_('DVR - Finished Recordings'), 'dvr_finished.html');
-        }
+        tbar: [downloadButton, rerecordButton, moveButton],
+        selected: selected
     });
 
     return panel;
@@ -479,11 +516,41 @@ tvheadend.dvr_failed = function(panel, index) {
         }
     };
 
+    var moveButton = {
+        name: 'move',
+        builder: function() {
+            return new Ext.Toolbar.Button({
+                tooltip: _('Mark the selected recording as finished'),
+                iconCls: 'movetofinished',
+                text: _('Move to finished'),
+                disabled: true
+            });
+        },
+        callback: function(conf, e, store, select) {
+            var r = select.getSelections();
+            if (r && r.length > 0) {
+                var uuids = [];
+                for (var i = 0; i < r.length; i++)
+                    uuids.push(r[i].id);
+                tvheadend.Ajax({
+                    url: 'api/dvr/entry/move/finished',
+                    params: {
+                        uuid: Ext.encode(uuids)
+                    },
+                    success: function(d) {
+                        store.reload();
+                    }
+                });
+            }
+        }
+    };
+
     function selected(s, abuttons) {
         var r = s.getSelections();
         var b = r.length > 0 && r[0].data.filesize > 0;
         abuttons.download.setDisabled(!b);
         abuttons.rerecord.setDisabled(r.length <= 0);
+        abuttons.move.setDisabled(r.length <= 0);
     }
 
     tvheadend.idnode_grid(panel, {
@@ -521,15 +588,11 @@ tvheadend.dvr_failed = function(panel, index) {
                     var title = r.data['disp_title'];
                     if (r.data['episode'])
                         title += ' / ' + r.data['episode'];
-                    return '<a href="play/dvrfile/' + r.id +
-                           '?title=' + encodeURIComponent(title) + '">' + _('Play') + '</a>';
+                    return tvheadend.playLink('play/dvrfile/' + r.id, title);
                 }
             }],
-        tbar: [downloadButton, rerecordButton],
-        selected: selected,
-        help: function() {
-            new tvheadend.help(_('DVR - Failed Recordings'), 'dvr_failed.html');
-        }
+        tbar: [downloadButton, rerecordButton, moveButton],
+        selected: selected
     });
 
     return panel;
@@ -552,10 +615,7 @@ tvheadend.dvr_settings = function(panel, index) {
             url: 'api/dvr/config',
             create: { }
         },
-        del: true,
-        help: function() {
-            new tvheadend.help(_('DVR'), 'config_dvr.html');
-        }
+        del: true
     });
 
     return panel;
@@ -581,6 +641,7 @@ tvheadend.autorec_editor = function(panel, index) {
             fulltext:     { width: 70 },
             channel:      { width: 200 },
             tag:          { width: 200 },
+            btype:        { width: 50 },
             content_type: { width: 100 },
             minduration:  { width: 100 },
             maxduration:  { width: 100 },
@@ -607,21 +668,18 @@ tvheadend.autorec_editor = function(panel, index) {
         add: {
             url: 'api/dvr/autorec',
             params: {
-               list: 'enabled,name,directory,title,fulltext,channel,tag,content_type,minduration,' +
+               list: 'enabled,name,directory,title,fulltext,channel,tag,btype,content_type,minduration,' +
                      'maxduration,weekdays,start,start_window,pri,dedup,retention,removal,' +
                      'maxcount,maxsched,config_name,comment'
             },
             create: { }
         },
         del: true,
-        list: 'enabled,name,directory,title,fulltext,channel,tag,content_type,minduration,' +
+        list: 'enabled,name,directory,title,fulltext,channel,tag,btype,content_type,minduration,' +
               'maxduration,weekdays,start,start_window,pri,dedup,config_name,owner,creator,comment',
         sort: {
           field: 'name',
           direction: 'ASC'
-        },
-        help: function() {
-            new tvheadend.help(_('DVR Autorec'), 'dvr_autorec.html');
         }
     });
 
@@ -672,9 +730,6 @@ tvheadend.timerec_editor = function(panel, index) {
         sort: {
           field: 'name',
           direction: 'ASC'
-        },
-        help: function() {
-            new tvheadend.help(_('DVR Timers'), 'dvr_timerec.html');
         }
     });
 

@@ -90,13 +90,18 @@ tvheadend.epgDetails = function(event) {
 
     var content = '';
     var duration = 0;
+    var chicon = 0;
 
     if (event.start && event.stop && event.stop - event.start > 0)
         duration = (event.stop - event.start) / 1000;
 
-    if (event.channelIcon != null && event.channelIcon.length > 0)
+    if (event.channelIcon != null && event.channelIcon.length > 0) {
         content += '<img class="x-epg-chicon" src="' + event.channelIcon + '">';
+        chicon = 1;
+    }
 
+    if (chicon)
+        content += '<div class="x-epg-left">';
     content += '<div class="x-epg-title">' + event.title;
     if (event.subtitle)
         content += "&nbsp;:&nbsp;" + event.subtitle;
@@ -104,21 +109,26 @@ tvheadend.epgDetails = function(event) {
     if (event.episodeOnscreen)
         content += '<div class="x-epg-title">' + event.episodeOnscreen + '</div>';
     if (event.start)
-      content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Start Time') + ':</div> ' + tvheadend.niceDate(event.start) + '</div>';
+      content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('Start Time') + ':</span><span class="x-epg-body">' + tvheadend.niceDate(event.start) + '</span></div>';
     if (event.stop)
-      content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('End Time') + ':</div> ' + tvheadend.niceDate(event.stop) + '</div>';
+      content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('End Time') + ':</span><span class="x-epg-body">' + tvheadend.niceDate(event.stop) + '</span></div>';
     if (duration)
-      content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Duration') + ':</div> ' + parseInt(duration / 60) + ' min</div>';
+      content += '<div class="x-epg-time"><span class="x-epg-prefix">' + _('Duration') + ':</span><span class="x-epg-body">' + parseInt(duration / 60) + ' ' + _('min') + '</span></div>';
+    if (chicon) {
+      content += '</div>'; /* x-epg-left */
+      content += '<div class="x-epg-bottom">';
+    }
+    content += '<hr class="x-epg-hr"/>';
     if (event.summary)
       content += '<div class="x-epg-summary">' + event.summary + '</div>';
     if (event.description)
       content += '<div class="x-epg-desc">' + event.description + '</div>';
-    if (event.starRating || event.ageRating || event.genre)
-      content += '<hr/>';
+    if (event.summary || event.description)
+      content += '<hr class="x-epg-hr"/>';
     if (event.starRating)
-      content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Star Rating') + ':</div> ' + event.starRating + '</div>';
+      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Star Rating') + ':</span><span class="x-epg-body">' + event.starRating + '</span></div>';
     if (event.ageRating)
-      content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Age Rating') + ':</div> ' + event.ageRating + '</div>';
+      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Age Rating') + ':</span><span class="x-epg-body">' + event.ageRating + '</span></div>';
     if (event.genre) {
       var genre = [];
       Ext.each(event.genre, function(g) {
@@ -129,11 +139,36 @@ tvheadend.epgDetails = function(event) {
         if (g1 || g2)
           genre.push((g1 ? '[' + g1 + '] ' : '') + g2);
       });
-      content += '<div class="x-epg-meta"><div class="x-epg-prefix">' + _('Content Type') + ':</div> ' + genre.join(', ') + '</div>';
+      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Content Type') + ':</span><span class="x-epg-body">' + genre.join(', ') + '</span></div>';
     }
+    var tags = [];
+    if (event.hd > 1)
+      tags.push(_('UHDTV'));
+    else if (event.hd > 0)
+      tags.push(_('HDTV'));
+    if ('new' in event)
+      tags.push(_('New#EPG').split('#')[0]);
+    if (event.repeat)
+      tags.push(_('Repeat#EPG').split('#')[0]);
+    if (event.widescreen)
+      tags.push(_('Widescreen'));
+    if (event.aspect)
+      tags.push(_('Aspect') + ' ' + (event.aspect / 100.0));
+    if (event.lines)
+      tags.push(_('Lines') + ' ' + event.lines);
+    if (event.deafsigned)
+      tags.push(_('Deaf signed#EPG').split('#')[0]);
+    if (event.subtitled)
+      tags.push(_('Subtitled#EPG').split('#')[0]);
+    if (event.audiodesc)
+      tags.push(_('Audio description#EPG').split('#')[0]);
+    if (tags.length > 0)
+      content += '<div class="x-epg-meta"><span class="x-epg-prefix">' + _('Parameters') + ':</span><span class="x-epg-body">' + tags.join(', ') + '</span></div>';
 
     content += '<div id="related"></div>';
     content += '<div id="altbcast"></div>';
+    if (chicon)
+      content += '</div>'; /* x-epg-bottom */
     
     var now = new Date();
     var buttons = [];
@@ -875,7 +910,7 @@ tvheadend.epg = function() {
             text: _('Help'),
             iconCls: 'help',
             handler: function() {
-                new tvheadend.help(_('Electronic Program Guide'), 'epg.html');
+                new tvheadend.mdhelp('epg');
             }
         }
     ];

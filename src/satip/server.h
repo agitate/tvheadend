@@ -29,9 +29,10 @@
 #include "udp.h"
 #include "http.h"
 
-#define MUXCNF_AUTO   0
-#define MUXCNF_KEEP   1
-#define MUXCNF_REJECT 2
+#define MUXCNF_AUTO               0
+#define MUXCNF_KEEP               1
+#define MUXCNF_REJECT             2
+#define MUXCNF_REJECT_EXACT_MATCH 3
 
 #define RTSP_TCP_DATA 1000000
 
@@ -51,8 +52,8 @@ struct satip_server_conf {
   int satip_dvbt2;
   int satip_dvbc;
   int satip_dvbc2;
-  int satip_atsc;
-  int satip_dvbcb;
+  int satip_atsc_t;
+  int satip_atsc_c;
   char *satip_nat_ip;
 };
 
@@ -82,6 +83,8 @@ void satip_rtp_close(void *id);
 void satip_rtp_init(int boot);
 void satip_rtp_done(void);
 
+int satip_rtsp_delsys(int fe, int *findex, const char **ftype);
+
 void satip_server_rtsp_init(const char *bindaddr, int port,
                             int descramble, int rewrite_pmt, int muxcnf,
                             const char *nat_ip);
@@ -93,7 +96,7 @@ int satip_server_http_page(http_connection_t *hc,
 
 int satip_server_match_uuid(const char *uuid);
 
-void satip_server_init(int rtsp_port);
+void satip_server_init(const char *bindaddr, int rtsp_port);
 void satip_server_register(void);
 void satip_server_done(void);
 
@@ -103,7 +106,7 @@ static inline int satip_server_match_uuid(const char *uuid) { return 0; }
 
 static inline void satip_server_config_changed(void) { };
 
-static inline void satip_server_init(int rtsp_port) { };
+static inline void satip_server_init(const char *bindaddr, int rtsp_port) { };
 static inline void satip_server_register(void) { };
 static inline void satip_server_done(void) { };
 

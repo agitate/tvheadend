@@ -88,7 +88,8 @@ typedef struct dvb_bat {
 int dvb_bouquets_parse = 1;
 
 static int
-psi_parse_pmt(mpegts_mux_t *mux, mpegts_service_t *t, const uint8_t *ptr, int len);
+psi_parse_pmt(mpegts_mux_t *mux, mpegts_service_t *t,
+              const uint8_t *ptr, int len, int *_update);
 
 static inline int
 mpegts_mux_alive(mpegts_mux_t *mm)
@@ -96,6 +97,7 @@ mpegts_mux_alive(mpegts_mux_t *mm)
   /*
    * Return, if mux seems to be alive for updating.
    */
+  if (mm->mm_enabled != MM_ENABLE) return 0;
   return !LIST_EMPTY(&mm->mm_services) && mm->mm_scan_result != MM_SCAN_FAIL;
 }
 
@@ -118,7 +120,7 @@ dvb_service_autoenable( mpegts_service_t *s, const char *where )
             s->s_nicename, s->s_dvb_service_id, s->s_dvb_service_id, where);
     service_set_enabled((service_t *)s, 1, SERVICE_AUTO_NORMAL);
   }
-  s->s_dvb_check_seen = dispatch_clock;
+  s->s_dvb_check_seen = gclk();
 }
 
 #if ENABLE_MPEGTS_DVB
@@ -146,10 +148,11 @@ static void
 dvb_fs_mux_add ( mpegts_table_t *mt, mpegts_mux_t *mm, mpegts_mux_t *mux )
 {
   const char *uuid;
+  char ubuf[UUID_HEX_SIZE];
   char *s;
   int i;
 
-  uuid = idnode_uuid_as_sstr(&mux->mm_id);
+  uuid = idnode_uuid_as_str(&mux->mm_id, ubuf);
   if (mm->mm_fastscan_muxes == NULL)
     mm->mm_fastscan_muxes = calloc(DVB_FASTSCAN_MUXES, UUID_HEX_SIZE);
   for (i = 0; i < DVB_FASTSCAN_MUXES * UUID_HEX_SIZE; i += UUID_HEX_SIZE) {
@@ -195,7 +198,7 @@ dvb_desc_sat_del
    uint16_t onid, uint16_t tsid,
    const uint8_t *ptr, int len, int force )
 {
-  int frequency, symrate;
+  int frequency, symrate, polarisation, orbitalpos;
   dvb_mux_conf_t dmc;
   char buf[128];
 
@@ -218,17 +221,25 @@ dvb_desc_sat_del
     return NULL;
   }
 
+  if (symrate < 1000) /* broken symrate? */
+    symrate *= 1000;
+
+  orbitalpos = bcdtoint(ptr[4]) * 100 + bcdtoint(ptr[5]);
+  if ((ptr[6] & 0x80) == 0) orbitalpos *= -1;
+  if (orbitalpos == 0)
+    orbitalpos = ((dvb_mux_t *)mm)->lm_tuning.u.dmc_fe_qpsk.orbital_pos;
+
+  polarisation = (ptr[6] >> 5) & 0x03;
+
   dvb_mux_conf_init(&dmc, (ptr[6] & 0x4) ? DVB_SYS_DVBS2 : DVB_SYS_DVBS);
 
   dmc.dmc_fe_freq                = frequency;
-  dmc.u.dmc_fe_qpsk.orbital_pos  = bcdtoint(ptr[4]) * 100 + bcdtoint(ptr[5]);
-  if ((ptr[6] & 0x80) == 0)
-    dmc.u.dmc_fe_qpsk.orbital_pos *= -1;
-  dmc.u.dmc_fe_qpsk.polarisation = (ptr[6] >> 5) & 0x03;
+  dmc.u.dmc_fe_qpsk.orbital_pos  = orbitalpos;
+  dmc.u.dmc_fe_qpsk.polarisation = polarisation;
 
   dmc.u.dmc_fe_qpsk.symbol_rate  = symrate * 100;
   dmc.u.dmc_fe_qpsk.fec_inner    = fec_tab[ptr[10] & 0x0f];
-  
+
   static int mtab[4] = {
     DVB_MOD_NONE, DVB_MOD_QPSK, DVB_MOD_PSK_8, DVB_MOD_QAM_16
   };
@@ -354,8 +365,8 @@ dvb_desc_terr_del
 
   /* Extract data */
   frequency     = ((ptr[0] << 24) | (ptr[1] << 16) | (ptr[2] << 8) | ptr[3]);
-  if (!frequency) {
-    tvhwarn(mt->mt_name, "dvb-t frequency error");
+  if (frequency < 1000000 || frequency > 200000000) {
+    tvhdebug(mt->mt_name, "dvb-t frequency error (%d)", frequency);
     return NULL;
   }
 
@@ -366,7 +377,8 @@ dvb_desc_terr_del
   dmc.dmc_fe_modulation                   = ctab[(ptr[5] >> 6) & 0x3];
   dmc.u.dmc_fe_ofdm.hierarchy_information = htab[(ptr[5] >> 3) & 0x3];
   dmc.u.dmc_fe_ofdm.code_rate_HP          = fec_tab[(ptr[5] + 1) & 0x7];
-  dmc.u.dmc_fe_ofdm.code_rate_LP          = fec_tab[((ptr[6] + 1) >> 5) & 0x7];
+  if (dmc.u.dmc_fe_ofdm.hierarchy_information != DVB_HIERARCHY_NONE)
+    dmc.u.dmc_fe_ofdm.code_rate_LP        = fec_tab[((ptr[6] + 1) >> 5) & 0x7];
   dmc.u.dmc_fe_ofdm.guard_interval        = gtab[(ptr[6] >> 3) & 0x3];
   dmc.u.dmc_fe_ofdm.transmission_mode     = ttab[(ptr[6] >> 1) & 0x3];
 
@@ -431,6 +443,7 @@ dvb_bat_find_service( dvb_bat_id_t *bi, mpegts_service_t *s,
   if (!bs) {
     bs = calloc(1, sizeof(*bs));
     bs->svc = s;
+    service_ref((service_t *)s);
     TAILQ_INSERT_TAIL(&bi->services, bs, link);
   }
   if (lcn != UINT_MAX && !bs->lcn_dtag) {
@@ -459,7 +472,7 @@ dvb_desc_service_list
       if (bi)
         dvb_bat_find_service(bi, s, 0, UINT_MAX);
       if (save)
-        s->s_config_save((service_t*)s);
+        idnode_changed(&s->s_id);
     }
   }
   return 0;
@@ -491,7 +504,7 @@ dvb_desc_local_channel
                     s->s_dvb_channel_num != lcn) {
           s->s_dvb_channel_dtag = dtag;
           s->s_dvb_channel_num = lcn;
-          s->s_config_save((service_t*)s);
+          idnode_changed(&s->s_id);
           service_refresh_channel((service_t*)s);
         }
       }
@@ -811,6 +824,7 @@ dvb_bskyb_local_channels
       if (s) {
         bs = calloc(1, sizeof(*bs));
         bs->svc = s;
+        service_ref((service_t *)s);
         TAILQ_INSERT_TAIL(&bi->services, bs, link);
       }
     }
@@ -859,9 +873,28 @@ dvb_pat_callback
   r    = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len,
                          tableid, tsid, 5, &st, &sect, &last, &ver);
   if (r != 1) return r;
+  if (tsid == 0) goto end;
 
   /* Multiplex */
-  tvhdebug("pat", "tsid %04X (%d)", tsid, tsid);
+  tvhdebug("pat", "%p: tsid %04X (%d)", mm, tsid, tsid);
+  if (mm->mm_tsid != MPEGTS_TSID_NONE) {
+    if (mm->mm_tsid && mm->mm_tsid != tsid) {
+      char buf[256];
+      if (++mm->mm_tsid_checks > 12) {
+        mpegts_mux_nice_name(mm, buf, sizeof(buf));
+        tvhwarn("pat", "%s: TSID change detected - old %04x (%d), new %04x (%d)",
+                buf, mm->mm_tsid, mm->mm_tsid, tsid, tsid);
+      } else {
+        if (tvhtrace_enabled()) {
+          mpegts_mux_nice_name(mm, buf, sizeof(buf));
+          tvhtrace("pat", "%s: ignore TSID - old %04x (%d), new %04x (%d) (checks %d)",
+                   buf, mm->mm_tsid, mm->mm_tsid, tsid, tsid, mm->mm_tsid_checks);
+        }
+        return 0; /* keep rolling */
+      }
+    }
+    mm->mm_tsid_checks = -100;
+  }
   mpegts_mux_set_tsid(mm, tsid, 1);
   
   /* Process each programme */
@@ -905,6 +938,7 @@ dvb_pat_callback
                      MPS_WEIGHT_NIT);
 
   /* End */
+end:
   return dvb_table_end((mpegts_psi_table_t *)mt, st, sect);
 }
 
@@ -962,11 +996,28 @@ dvb_cat_callback
  * PMT processing
  */
 
+/* PMT update reason flags */
+#define PMT_UPDATE_PCR                (1<<0)
+#define PMT_UPDATE_NEW_STREAM         (1<<1)
+#define PMT_UPDATE_LANGUAGE           (1<<2)
+#define PMT_UPDATE_AUDIO_TYPE         (1<<3)
+#define PMT_UPDATE_FRAME_DURATION     (1<<4)
+#define PMT_UPDATE_COMPOSITION_ID     (1<<5)
+#define PMT_UPDATE_ANCILLARY_ID       (1<<6)
+#define PMT_UPDATE_STREAM_DELETED     (1<<7)
+#define PMT_UPDATE_NEW_CA_STREAM      (1<<8)
+#define PMT_UPDATE_NEW_CAID           (1<<9)
+#define PMT_UPDATE_CA_PROVIDER_CHANGE (1<<10)
+#define PMT_UPDATE_PARENT_PID         (1<<11)
+#define PMT_UPDATE_CAID_DELETED       (1<<12)
+#define PMT_UPDATE_CAID_PID           (1<<13)
+#define PMT_REORDERED                 (1<<14)
+
 int
 dvb_pmt_callback
   (mpegts_table_t *mt, const uint8_t *ptr, int len, int tableid)
 {
-  int r, sect, last, ver;
+  int r, sect, last, ver, update;
   uint16_t sid;
   mpegts_mux_t *mm = mt->mt_mux;
   mpegts_service_t *s;
@@ -985,11 +1036,15 @@ dvb_pmt_callback
 
   /* Process */
   tvhdebug("pmt", "sid %04X (%d)", sid, sid);
+  update = 0;
   pthread_mutex_lock(&s->s_stream_mutex);
-  r = psi_parse_pmt(mt->mt_mux, s, ptr, len);
+  r = psi_parse_pmt(mt->mt_mux, s, ptr, len, &update);
   pthread_mutex_unlock(&s->s_stream_mutex);
   if (r)
     service_restart((service_t*)s);
+  else if (update & (PMT_UPDATE_NEW_CA_STREAM|PMT_UPDATE_NEW_CAID|
+                     PMT_UPDATE_CAID_DELETED|PMT_UPDATE_CAID_PID))
+    descrambler_caid_changed((service_t *)s);
 
 #if ENABLE_LINUXDVB_CA
   /* DVBCAM requires full pmt data including header and crc */
@@ -1012,10 +1067,17 @@ dvb_bat_destroy_lists( mpegts_table_t *mt )
   dvb_bat_svc_t *bs;
   dvb_freesat_region_t *fr;
   dvb_freesat_svc_t *fs;
+  bouquet_t *bq;
 
+  if (mt->mt_table == DVB_FASTSCAN_NIT_BASE) {
+    bq = mt->mt_opaque;
+    bq->bq_fastscan_bi = NULL;
+  }
   while ((bi = LIST_FIRST(&b->bats)) != NULL) {
     while ((bs = TAILQ_FIRST(&bi->services)) != NULL) {
       TAILQ_REMOVE(&bi->services, bs, link);
+      if (bs->svc)
+        service_unref((service_t *)bs->svc);
       free(bs);
     }
     while ((fs = TAILQ_FIRST(&bi->fservices)) != NULL) {
@@ -1123,7 +1185,7 @@ dvb_nit_mux
   const char *charset;
   char buf[128], dauth[256];
 
-  if (mux && !mux->mm_enabled)
+  if (mux && mux->mm_enabled != MM_ENABLE)
     bi = NULL;
 
   charset = dvb_charset_find(mux ? mux->mm_network : mm->mm_network, mux, NULL);
@@ -1217,7 +1279,7 @@ dvb_nit_mux
       break;
     case 0x83:
       if (priv == 0 || priv == 0x28 || priv == 0x29 || priv == 0xa5 ||
-          priv == 0x233A) goto lcn;
+          priv == 0x233A || priv == 0x3200 || priv == 0x3201) goto lcn;
       break;
     case 0x86:
       if (priv == 0) goto lcn;
@@ -1282,14 +1344,22 @@ dvb_nit_callback
   nbid = (ptr[0] << 8) | ptr[1];
 
   /* Begin */
-  if (tableid != 0x40 && tableid != 0x41 && tableid != 0x4A &&
-      tableid != DVB_FASTSCAN_NIT_BASE)
+  if (tableid == DVB_FASTSCAN_NIT_BASE) {
+    bq = mt->mt_opaque;
+  } else if (tableid != 0x40 && tableid != 0x41 && tableid != 0x4A) {
     return -1;
+  }
 
   r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len,
                       tableid, nbid, 7, &st, &sect, &last, &ver);
   if (r == 0) {
     if (tableid == 0x4A || tableid == DVB_FASTSCAN_NIT_BASE) {
+      if (tableid == DVB_FASTSCAN_NIT_BASE && bq) {
+        bq->bq_fastscan_nit = 0;
+        if (bq->bq_fastscan_sdt)
+          return 1;
+        bq = NULL;
+      }
       if ((b = mt->mt_bat) != NULL) {
         if (!b->complete) {
           dvb_bat_completed(b, mt->mt_name, tableid, mm->mm_tsid, nbid,
@@ -1342,6 +1412,9 @@ dvb_nit_callback
       mt->mt_working++;
       mt->mt_flags |= MT_FASTSWITCH;
     }
+    if (tableid == DVB_FASTSCAN_NIT_BASE && bq)
+      if (!bq->bq_fastscan_nit && !bq->bq_fastscan_sdt)
+        bi = NULL;
   }
 
   /* Network Descriptors */
@@ -1377,8 +1450,10 @@ dvb_nit_callback
   /* Fastscan */
   if (tableid == DVB_FASTSCAN_NIT_BASE) {
     tvhdebug(mt->mt_name, "fastscan %04X (%d) [%s]", nbid, nbid, name);
-    bq = mt->mt_opaque;
-    dvb_bouquet_comment(bq, mm);
+    if (bq && bi) {
+      dvb_bouquet_comment(bq, mm);
+      bq->bq_fastscan_bi = bi;
+    }
 
   /* BAT */
   } else if (tableid == 0x4A) {
@@ -1393,9 +1468,9 @@ dvb_nit_callback
     tvhdebug(mt->mt_name, "network %04X (%d) [%s]", nbid, nbid, name);
     save |= mpegts_network_set_network_name(mn, name);
     if (save)
-      mn->mn_config_save(mn);
+      idnode_changed(&mn->mn_id);
     if (mpegts_mux_set_network_name(mm, name))
-      mm->mm_config_save(mm);
+      idnode_changed(&mm->mm_id);
   }
 
   /* Transport length */
@@ -1602,8 +1677,8 @@ dvb_sdt_callback
 
   /* Find Transport Stream */
   if (tableid == 0x42) {
+    if (mm->mm_tsid != tsid) return 0; /* keep rolling - perhaps PAT was not parsed yet */
     mpegts_mux_set_onid(mm, onid);
-    mpegts_mux_set_tsid(mm, tsid, 1);
     r = dvb_sdt_mux(mt, mm, mm, ptr, len, tableid);
     if (r)
       return r;
@@ -1729,7 +1804,7 @@ atsc_vct_callback
 
         /* Save */
         if (save)
-          s->s_config_save((service_t*)s);
+          idnode_changed(&s->s_id);
      }
 
     /* Move on */
@@ -1789,7 +1864,7 @@ dvb_bat_callback
 static int
 dvb_fs_sdt_mux
   ( mpegts_table_t *mt, mpegts_mux_t *mm, mpegts_psi_table_state_t *st,
-    const uint8_t *ptr, int len, int discovery )
+    const uint8_t *ptr, int len, int discovery, dvb_bat_id_t *bi )
 {
   uint16_t onid, tsid, service_id;
   uint8_t dtag;
@@ -1865,6 +1940,9 @@ dvb_fs_sdt_mux
     tvhtrace(mt->mt_name, "    type %d name [%s] provider [%s]",
              stype, sname, sprov);
 
+    if (bi)
+      dvb_bat_find_service(bi, s, 0, UINT_MAX);
+
     /* Update service type */
     if (stype && !s->s_dvb_servicetype) {
       int r;
@@ -1927,7 +2005,8 @@ dvb_fs_sdt_callback
   int r, sect, last, ver;
   uint16_t nbid;
   mpegts_mux_t *mm = mt->mt_mux;
-  mpegts_psi_table_state_t *st  = NULL;
+  bouquet_t *bq = mt->mt_opaque;
+  mpegts_psi_table_state_t *st = NULL;
 
   /* Fastscan ID */
   nbid = (ptr[0] << 8) | ptr[1];
@@ -1935,42 +2014,34 @@ dvb_fs_sdt_callback
   /* Begin */
   if (tableid != 0xBD)
     return -1;
+  if (bq) {
+    if (bq->bq_fastscan_nit)
+      return 1;
+    if (!bq->bq_fastscan_sdt)
+      return 0;
+  }
   r = dvb_table_begin((mpegts_psi_table_t *)mt, ptr, len,
                       tableid, nbid, 7, &st, &sect, &last, &ver);
   if (r == 0) {
     mt->mt_working -= st->working;
     st->working = 0;
+    if (bq)
+      bq->bq_fastscan_sdt = 0;
+    mpegts_table_destroy(mt);
   }
   if (r != 1) return r;
   if (len < 5) return -1;
   ptr += 5;
   len -= 5;
 
-  dvb_fs_sdt_mux(mt, mm, st, ptr, len, 1);
-  dvb_fs_sdt_mux(mt, mm, st, ptr, len, 0);
+  dvb_fs_sdt_mux(mt, mm, st, ptr, len, 1, NULL);
+  dvb_fs_sdt_mux(mt, mm, st, ptr, len, 0,
+                 bq && bq->bq_fastscan_nit ? bq->bq_fastscan_bi : NULL);
 
   /* End */
   return dvb_table_end((mpegts_psi_table_t *)mt, st, sect);
 }
 #endif
-
-/**
- * PMT update reason flags
- */
-#define PMT_UPDATE_PCR                0x1
-#define PMT_UPDATE_NEW_STREAM         0x2
-#define PMT_UPDATE_LANGUAGE           0x4
-#define PMT_UPDATE_AUDIO_TYPE         0x8
-#define PMT_UPDATE_FRAME_DURATION     0x10
-#define PMT_UPDATE_COMPOSITION_ID     0x20
-#define PMT_UPDATE_ANCILLARY_ID       0x40
-#define PMT_UPDATE_STREAM_DELETED     0x80
-#define PMT_UPDATE_NEW_CA_STREAM      0x100
-#define PMT_UPDATE_NEW_CAID           0x200
-#define PMT_UPDATE_CA_PROVIDER_CHANGE 0x400
-#define PMT_UPDATE_PARENT_PID         0x800
-#define PMT_UPDATE_CAID_DELETED       0x1000
-#define PMT_REORDERED                 0x2000
 
 /**
  * Add a CA descriptor
@@ -1997,6 +2068,8 @@ psi_desc_add_ca
 
   LIST_FOREACH(c, &st->es_caids, link) {
     if(c->caid == caid) {
+      if (c->pid > 0 && c->pid != pid)
+        r |= PMT_UPDATE_CAID_PID;
       c->pid = pid;
 
       if(c->providerid != provid) {
@@ -2044,8 +2117,8 @@ psi_desc_ca(mpegts_service_t *t, const uint8_t *buffer, int size)
     break;
   case 0x0500:// Viaccess
     for (i = 4; i < size;) {
-      unsigned char nano = buffer[i++];
-      unsigned char nanolen = buffer[i++];
+      uint8_t nano    = buffer[i++];
+      uint8_t nanolen = buffer[i++];
 
       if (nano == 0x14) {
         provid = (buffer[i] << 16) | (buffer[i + 1] << 8) | (buffer[i + 2] & 0xf0);
@@ -2131,7 +2204,7 @@ psi_desc_teletext(mpegts_service_t *t, const uint8_t *ptr, int size,
  */
 static int
 psi_parse_pmt
-  (mpegts_mux_t *mux, mpegts_service_t *t, const uint8_t *ptr, int len)
+  (mpegts_mux_t *mux, mpegts_service_t *t, const uint8_t *ptr, int len, int *_update)
 {
   int ret = 0;
   uint16_t pcr_pid, pid;
@@ -2146,6 +2219,7 @@ psi_parse_pmt
   int version;
   int position;
   int tt_position;
+  int video_stream;
   const char *lang;
   uint8_t audio_type;
 
@@ -2212,6 +2286,7 @@ psi_parse_pmt
     tt_position = 1000;
     lang = NULL;
     audio_type = 0;
+    video_stream = 0;
 
     switch(estype) {
     case 0x01:
@@ -2269,6 +2344,10 @@ psi_parse_pmt
         update |= psi_desc_ca(t, ptr, dlen);
         break;
 
+      case DVB_DESC_VIDEO_STREAM:
+        video_stream = dlen > 0 && SCT_ISVIDEO(hts_stream_type);
+        break;
+
       case DVB_DESC_REGISTRATION:
         if(mux->mm_pmt_ac3 != MM_AC3_PMT_N05 && dlen == 4 &&
            ptr[0] == 'A' && ptr[1] == 'C' && ptr[2] == '-' &&  ptr[3] == '3')
@@ -2302,7 +2381,7 @@ psi_parse_pmt
         break;
 
       case DVB_DESC_SUBTITLE:
-        if(dlen < 8)
+        if(dlen < 8 || video_stream)
           break;
 
         lang = lang_code_get2((const char*)ptr, 3);
@@ -2395,7 +2474,7 @@ psi_parse_pmt
 
   if(update) {
     tvhdebug("pmt", "Service \"%s\" PMT (version %d) updated"
-     "%s%s%s%s%s%s%s%s%s%s%s%s%s",
+     "%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
      service_nicename((service_t*)t), version,
      update&PMT_UPDATE_PCR               ? ", PCR PID changed":"",
      update&PMT_UPDATE_NEW_STREAM        ? ", New elementary stream":"",
@@ -2409,27 +2488,26 @@ psi_parse_pmt
      update&PMT_UPDATE_CA_PROVIDER_CHANGE? ", CA provider changed":"",
      update&PMT_UPDATE_PARENT_PID        ? ", Parent PID changed":"",
      update&PMT_UPDATE_CAID_DELETED      ? ", CAID deleted":"",
+     update&PMT_UPDATE_CAID_PID          ? ", CAID PID changed":"",
      update&PMT_REORDERED                ? ", PIDs reordered":"");
     
     service_request_save((service_t*)t, 1);
 
     // Only restart if something that our clients worry about did change
     if(update & ~(PMT_UPDATE_NEW_CA_STREAM |
-      PMT_UPDATE_NEW_CAID |
-      PMT_UPDATE_CA_PROVIDER_CHANGE | 
-      PMT_UPDATE_CAID_DELETED)) {
+                  PMT_UPDATE_NEW_CAID |
+                  PMT_UPDATE_CA_PROVIDER_CHANGE |
+                  PMT_UPDATE_CAID_DELETED |
+                  PMT_UPDATE_CAID_PID)) {
       if(t->s_status == SERVICE_RUNNING)
         ret = 1;
     }
-    
-    // notify descrambler that we found another CAIDs
-    if (update & PMT_UPDATE_NEW_CAID)
-      descrambler_caid_changed((service_t *)t);
   }
 
   if (service_has_audio_or_video((service_t *)t))
     dvb_service_autoenable(t, "PAT and PMT");
 
+  *_update = update;
   return ret;
 }
 
@@ -2439,13 +2517,13 @@ psi_parse_pmt
 
 static void dvb_time_update(const uint8_t *ptr, const char *srcname)
 {
-  static time_t dvb_last_update = 0;
+  static int64_t dvb_last_update = 0;
   time_t t;
-  if (dvb_last_update + 1800 < dispatch_clock) {
+  if (dvb_last_update + sec2mono(1800) < mclk()) {
     t = dvb_convert_date(ptr, 0);
     if (t > 0) {
       tvhtime_update(t, srcname);
-      dvb_last_update = dispatch_clock;
+      dvb_last_update = mclk();
     }
   }
 }
@@ -2499,11 +2577,13 @@ static void
 psi_tables_dvb_fastscan( void *aux, bouquet_t *bq, const char *name, int pid )
 {
   tvhtrace("fastscan", "adding table %04X (%i) for '%s'", pid, pid, name);
+  bq->bq_fastscan_nit = 1;
+  bq->bq_fastscan_sdt = 1;
   mpegts_table_add(aux, DVB_FASTSCAN_NIT_BASE, DVB_FASTSCAN_MASK,
                    dvb_nit_callback, bq, "fs_nit", MT_CRC, pid,
                    MPS_WEIGHT_NIT2);
   mpegts_table_add(aux, DVB_FASTSCAN_SDT_BASE, DVB_FASTSCAN_MASK,
-                   dvb_fs_sdt_callback, NULL, "fs_sdt", MT_CRC, pid,
+                   dvb_fs_sdt_callback, bq, "fs_sdt", MT_CRC, pid,
                    MPS_WEIGHT_SDT2);
 }
 #endif
@@ -2575,7 +2655,10 @@ psi_tables_install ( mpegts_input_t *mi, mpegts_mux_t *mm,
   case DVB_SYS_DVBT2:
   case DVB_SYS_DVBS:
   case DVB_SYS_DVBS2:
+  case DVB_SYS_ISDBT:
+  case DVB_SYS_ISDBC:
   case DVB_SYS_ISDBS:
+  case DVB_SYS_DAB:
     psi_tables_dvb(mm);
     break;
   case DVB_SYS_TURBO:
@@ -2588,12 +2671,9 @@ psi_tables_install ( mpegts_input_t *mi, mpegts_mux_t *mm,
     break;
   case DVB_SYS_NONE:
   case DVB_SYS_DVBH:
-  case DVB_SYS_ISDBT:
-  case DVB_SYS_ISDBC:
   case DVB_SYS_DTMB:
   case DVB_SYS_CMMB:
   case DVB_SYS_DSS:
-  case DVB_SYS_DAB:
     break;
   case DVB_SYS_ATSC_ALL:
     psi_tables_atsc_c(mm);

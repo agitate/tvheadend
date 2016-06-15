@@ -47,28 +47,35 @@ mpegts_mux_sched_set_timer ( mpegts_mux_sched_t *mms )
     if (mms->mms_timeout <= 0)
       gtimer_disarm(&mms->mms_timer);
     else {
-      gtimer_arm(&mms->mms_timer, mpegts_mux_sched_timer, mms,
-                 mms->mms_timeout);
+      gtimer_arm_rel(&mms->mms_timer, mpegts_mux_sched_timer, mms,
+                     mms->mms_timeout);
     }
   } else {
     time_t now, nxt;
     time(&now);
     if (!cron_next(&mms->mms_cronjob, now, &nxt)) {
-      gtimer_arm_abs(&mms->mms_timer, mpegts_mux_sched_timer, mms, nxt);
+      gtimer_arm_absn(&mms->mms_timer, mpegts_mux_sched_timer, mms, nxt);
     }
   }
 }
 
 static void
-mpegts_mux_sched_class_save ( idnode_t *in )
+mpegts_mux_sched_class_changed ( idnode_t *in )
 {
   mpegts_mux_sched_t *mms = (mpegts_mux_sched_t*)in;
 
   /* Update timer */
   mpegts_mux_sched_set_timer(mms);
+}
 
-  /* Save */
-  mpegts_mux_sched_save(mms);
+static htsmsg_t *
+mpegts_mux_sched_class_save ( idnode_t *in, char *filename, size_t fsize )
+{
+  htsmsg_t *c = htsmsg_create_map();
+  char ubuf[UUID_HEX_SIZE];
+  idnode_save(in, c);
+  snprintf(filename, fsize, "muxsched/%s", idnode_uuid_as_str(in, ubuf));
+  return c;
 }
 
 static void
@@ -112,11 +119,16 @@ mpegts_mux_sched_class_cron_set ( void *p, const void *v )
   return 0;
 }
 
+CLASS_DOC(mpegts_mux_sched)
+PROP_DOC(cron)
+
 const idclass_t mpegts_mux_sched_class =
 {
   .ic_class      = "mpegts_mux_sched",
-  .ic_caption    = N_("Mux schedule entry"),
+  .ic_caption    = N_("Mux Scheduler"),
   .ic_event      = "mpegts_mux_sched",
+  .ic_doc        = tvh_doc_mpegts_mux_sched_class,
+  .ic_changed    = mpegts_mux_sched_class_changed,
   .ic_save       = mpegts_mux_sched_class_save,
   .ic_delete     = mpegts_mux_sched_class_delete,
   .ic_properties = (const property_t[]){
@@ -124,6 +136,7 @@ const idclass_t mpegts_mux_sched_class =
       .type     = PT_BOOL,
       .id       = "enabled",
       .name     = N_("Enabled"),
+      .desc     = N_("Enable/disable the entry."),
       .off      = offsetof(mpegts_mux_sched_t, mms_enabled),
       .def.i    = 1,
     },
@@ -131,6 +144,7 @@ const idclass_t mpegts_mux_sched_class =
       .type     = PT_STR,
       .id       = "mux",
       .name     = N_("Mux"),
+      .desc     = N_("The mux to play when the entry is triggered."),
       .off      = offsetof(mpegts_mux_sched_t, mms_mux),
       .list     = mpegts_mux_sched_class_mux_list,
     },
@@ -138,6 +152,8 @@ const idclass_t mpegts_mux_sched_class =
       .type     = PT_STR,
       .id       = "cron",
       .name     = N_("Cron"),
+      .desc     = N_("Schedule frequency (in Cron format)."),
+      .doc      = prop_doc_cron,
       .off      = offsetof(mpegts_mux_sched_t, mms_cronstr),
       .set      = mpegts_mux_sched_class_cron_set,
     },
@@ -145,6 +161,8 @@ const idclass_t mpegts_mux_sched_class =
       .type     = PT_INT,
       .id       = "timeout",
       .name     = N_("Timout (secs)"),
+      .desc     = N_("The length of time (in seconds) to play the mux "
+                     "for. 1 hour = 3600."),
       .off      = offsetof(mpegts_mux_sched_t, mms_timeout),
     },
     {
@@ -163,7 +181,7 @@ mpegts_mux_sched_input ( void *p, streaming_message_t *sm )
 
   switch (sm->sm_type) {
     case SMT_STOP:
-      gtimer_arm(&mms->mms_timer, mpegts_mux_sched_timer, mms, 0);
+      gtimer_arm_rel(&mms->mms_timer, mpegts_mux_sched_timer, mms, 0);
       break;
     default:
       // ignore
@@ -218,14 +236,14 @@ mpegts_mux_sched_timer ( void *p )
 
     /* Failed (try-again soon) */
     if (!mms->mms_sub) {
-      gtimer_arm(&mms->mms_timer, mpegts_mux_sched_timer, mms, 60);
+      gtimer_arm_rel(&mms->mms_timer, mpegts_mux_sched_timer, mms, 60);
 
     /* OK */
     } else {
       mms->mms_active = 1;
       if (mms->mms_timeout > 0) {
-        gtimer_arm(&mms->mms_timer, mpegts_mux_sched_timer, mms,
-                   mms->mms_timeout);
+        gtimer_arm_rel(&mms->mms_timer, mpegts_mux_sched_timer, mms,
+                       mms->mms_timeout);
       } 
     }
 
@@ -244,7 +262,7 @@ mpegts_mux_sched_timer ( void *p )
     }
 
     /* Timer */
-    gtimer_arm_abs(&mms->mms_timer, mpegts_mux_sched_timer, mms, nxt);
+    gtimer_arm_absn(&mms->mms_timer, mpegts_mux_sched_timer, mms, nxt);
   }
 }
 
@@ -295,20 +313,13 @@ mpegts_mux_sched_create ( const char *uuid, htsmsg_t *conf )
 }
 
 void
-mpegts_mux_sched_save ( mpegts_mux_sched_t *mms )
-{
-  htsmsg_t *c = htsmsg_create_map();
-  idnode_save(&mms->mms_id, c);
-  hts_settings_save(c, "muxsched/%s", idnode_uuid_as_sstr(&mms->mms_id));
-  htsmsg_destroy(c);
-}
-
-void
 mpegts_mux_sched_delete ( mpegts_mux_sched_t *mms, int delconf )
 {
+  char ubuf[UUID_HEX_SIZE];
+
   LIST_REMOVE(mms, mms_link);
   if (delconf)
-    hts_settings_remove("muxsched/%s", idnode_uuid_as_sstr(&mms->mms_id));
+    hts_settings_remove("muxsched/%s", idnode_uuid_as_str(&mms->mms_id, ubuf));
   if (mms->mms_sub)
     subscription_unsubscribe(mms->mms_sub, UNSUBSCRIBE_FINAL);
   gtimer_disarm(&mms->mms_timer);
@@ -325,6 +336,8 @@ mpegts_mux_sched_init ( void )
 {
   htsmsg_t *c, *e;
   htsmsg_field_t *f;
+
+  idclass_register(&mpegts_mux_sched_class);
 
   /* Load settings */
   if ((c = hts_settings_load_r(1, "muxsched"))) {

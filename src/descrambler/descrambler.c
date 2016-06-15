@@ -35,7 +35,7 @@
 
 typedef struct th_descrambler_data {
   TAILQ_ENTRY(th_descrambler_data) dd_link;
-  time_t dd_timestamp;
+  int64_t dd_timestamp;
   sbuf_t dd_sbuf;
 } th_descrambler_data_t;
 
@@ -66,7 +66,7 @@ descrambler_data_destroy(th_descrambler_runtime_t *dr, th_descrambler_data_t *dd
 }
 
 static void
-descrambler_data_time_flush(th_descrambler_runtime_t *dr, time_t oldest)
+descrambler_data_time_flush(th_descrambler_runtime_t *dr, int64_t oldest)
 {
   th_descrambler_data_t *dd;
 
@@ -84,14 +84,14 @@ descrambler_data_append(th_descrambler_runtime_t *dr, const uint8_t *tsb, int le
   if (len == 0)
     return;
   dd = TAILQ_LAST(&dr->dr_queue, th_descrambler_queue);
-  if (dd && dd->dd_timestamp == dispatch_clock &&
+  if (dd && monocmpfastsec(dd->dd_timestamp, mclk()) &&
       (dd->dd_sbuf.sb_data[3] & 0x40) == (tsb[3] & 0x40)) { /* key match */
     sbuf_append(&dd->dd_sbuf, tsb, len);
     dr->dr_queue_total += len;
     return;
   }
   dd = malloc(sizeof(*dd));
-  dd->dd_timestamp = dispatch_clock;
+  dd->dd_timestamp = mclk();
   sbuf_init(&dd->dd_sbuf);
   sbuf_append(&dd->dd_sbuf, tsb, len);
   TAILQ_INSERT_TAIL(&dr->dr_queue, dd, dd_link);
@@ -104,9 +104,10 @@ descrambler_data_cut(th_descrambler_runtime_t *dr, int len)
   th_descrambler_data_t *dd;
 
   while (len > 0 && (dd = TAILQ_FIRST(&dr->dr_queue)) != NULL) {
+    if (dr->dr_skip)
+      ts_skip_packet2((mpegts_service_t *)dr->dr_service,
+                      dd->dd_sbuf.sb_data, MIN(len, dd->dd_sbuf.sb_ptr));
     if (len < dd->dd_sbuf.sb_ptr) {
-      if (dr->dr_skip)
-        ts_skip_packet2((mpegts_service_t *)dr->dr_service, dd->dd_sbuf.sb_data, len);
       sbuf_cut(&dd->dd_sbuf, len);
       dr->dr_queue_total -= len;
       break;
@@ -246,9 +247,10 @@ descrambler_service_start ( service_t *t )
   if (!((mpegts_service_t *)t)->s_dvb_forcecaid) {
 
     count = 0;
-    TAILQ_FOREACH(st, &t->s_filt_components, es_filt_link) {
-      LIST_FOREACH(ca, &st->es_caids, link)
-        for (p = constcw_table; *p; p++)
+    TAILQ_FOREACH(st, &t->s_filt_components, es_filt_link)
+      LIST_FOREACH(ca, &st->es_caids, link) {
+        if (ca->use == 0) continue;
+        for (p = constcw_table; p && *p; p++)
           if (ca->caid == *p) {
             constcw = 1;
             break;
@@ -260,6 +262,16 @@ descrambler_service_start ( service_t *t )
     if (count == 0)
       return;
 
+  } else {
+
+    if (constcw_table) {
+      for (p = constcw_table; *p; p++)
+        if (*p == ((mpegts_service_t *)t)->s_dvb_forcecaid) {
+          constcw = 1;
+          break;
+        }
+    }
+
   }
 
   ((mpegts_service_t *)t)->s_dvb_mux->mm_descrambler_flush = 0;
@@ -268,11 +280,12 @@ descrambler_service_start ( service_t *t )
     dr->dr_service = t;
     TAILQ_INIT(&dr->dr_queue);
     dr->dr_key_index = 0xff;
-    dr->dr_key_interval = 10;
+    dr->dr_key_interval = sec2mono(10);
     dr->dr_key_const = constcw;
     if (constcw)
       tvhtrace("descrambler", "using constcw for \"%s\"", t->s_nicename);
     dr->dr_skip = 0;
+    dr->dr_force_skip = 0;
     tvhcsa_init(&dr->dr_csa);
   }
   caclient_start(t);
@@ -320,6 +333,42 @@ descrambler_caid_changed ( service_t *t )
   }
 }
 
+static void
+descrambler_notify_deliver( mpegts_service_t *t, descramble_info_t *di )
+{
+  streaming_message_t *sm;
+  int r;
+
+  lock_assert(&t->s_stream_mutex);
+  if (!t->s_descramble_info)
+    t->s_descramble_info = calloc(1, sizeof(*di));
+  r = memcmp(t->s_descramble_info, di, sizeof(*di));
+  if (r == 0) { /* identical */
+    free(di);
+    return;
+  }
+  memcpy(t->s_descramble_info, di, sizeof(*di));
+
+  sm = streaming_msg_create(SMT_DESCRAMBLE_INFO);
+  sm->sm_data = di;
+
+  streaming_pad_deliver(&t->s_streaming_pad, sm);
+}
+
+static void
+descrambler_notify_nokey( th_descrambler_runtime_t *dr )
+{
+  mpegts_service_t *t = (mpegts_service_t *)dr->dr_service;
+  descramble_info_t *di;
+
+  tvhlog(LOG_DEBUG, "descrambler", "no key for service='%s'", t->s_dvb_svcname);
+
+  di = calloc(1, sizeof(*di));
+  di->pid = t->s_pmt_pid;
+
+  descrambler_notify_deliver(t, di);
+}
+
 void
 descrambler_notify( th_descrambler_t *td,
                     uint16_t caid, uint32_t provid,
@@ -328,7 +377,6 @@ descrambler_notify( th_descrambler_t *td,
                     const char *protocol )
 {
   mpegts_service_t *t = (mpegts_service_t *)td->td_service;
-  streaming_message_t *sm;
   descramble_info_t *di;
 
   tvhlog(LOG_DEBUG, "descrambler", "info - service='%s' caid=%04X(%s) "
@@ -341,8 +389,7 @@ descrambler_notify( th_descrambler_t *td,
   if (t->s_descrambler != td)
     return;
 
-  sm = streaming_msg_create(SMT_DESCRAMBLE_INFO);
-  sm->sm_data = di = calloc(1, sizeof(*di));
+  di = calloc(1, sizeof(*di));
 
   di->pid     = pid;
   di->caid    = caid;
@@ -354,12 +401,8 @@ descrambler_notify( th_descrambler_t *td,
   strncpy(di->from, from, sizeof(di->protocol)-1);
   strncpy(di->protocol, protocol, sizeof(di->protocol)-1);
 
-  if (!t->s_descramble_info)
-    t->s_descramble_info = calloc(1, sizeof(*di));
-  memcpy(t->s_descramble_info, di, sizeof(*di));
-
   pthread_mutex_lock(&t->s_stream_mutex);
-  streaming_pad_deliver(&t->s_streaming_pad, sm);
+  descrambler_notify_deliver(t, di);
   pthread_mutex_unlock(&t->s_stream_mutex);
 }
 
@@ -389,10 +432,10 @@ descrambler_keys ( th_descrambler_t *td, int type,
     return;
   }
 
-  if (tvhcsa_set_type(&dr->dr_csa, type) < 0)
-    return;
-
   pthread_mutex_lock(&t->s_stream_mutex);
+
+  if (tvhcsa_set_type(&dr->dr_csa, type) < 0)
+    goto fin;
 
   LIST_FOREACH(td2, &t->s_descramblers, td_service_link)
     if (td2 != td && td2->td_keystate == DS_RESOLVED) {
@@ -414,14 +457,14 @@ descrambler_keys ( th_descrambler_t *td, int type,
     memcpy(dr->dr_key_even, even, dr->dr_csa.csa_keylen);
     dr->dr_key_changed |= 1;
     dr->dr_key_valid |= 0x40;
-    dr->dr_key_timestamp[0] = dispatch_clock;
+    dr->dr_key_timestamp[0] = mclk();
   }
   if (memcmp(empty, odd, dr->dr_csa.csa_keylen)) {
     j++;
     memcpy(dr->dr_key_odd, odd, dr->dr_csa.csa_keylen);
     dr->dr_key_changed |= 2;
     dr->dr_key_valid |= 0x80;
-    dr->dr_key_timestamp[1] = dispatch_clock;
+    dr->dr_key_timestamp[1] = mclk();
   }
 
   if (j) {
@@ -454,7 +497,7 @@ descrambler_keys ( th_descrambler_t *td, int type,
       tvhtrace("descrambler", "Unknown keys from %s for for service \"%s\"",
                td->td_nicename, ((mpegts_service_t *)t)->s_dvb_svcname);
     }
-    dr->dr_ecm_last_key_time = dispatch_clock;
+    dr->dr_ecm_last_key_time = mclk();
     td->td_keystate = DS_RESOLVED;
     td->td_service->s_descrambler = td;
   } else {
@@ -505,7 +548,7 @@ fin:
 #endif
 }
 
-static void
+void
 descrambler_flush_table_data( service_t *t )
 {
   mpegts_service_t *ms = (mpegts_service_t *)t;
@@ -532,25 +575,25 @@ descrambler_flush_table_data( service_t *t )
 }
 
 static inline void
-key_update( th_descrambler_runtime_t *dr, uint8_t key, time_t timestamp )
+key_update( th_descrambler_runtime_t *dr, uint8_t key, int64_t timestamp )
 {
   /* set the even (0) or odd (0x40) key index */
   dr->dr_key_index = key & 0x40;
   if (dr->dr_key_start) {
-    dr->dr_key_interval = dr->dr_key_start + 50 < timestamp ?
-                          10 : timestamp - dr->dr_key_start;
+    dr->dr_key_interval = dr->dr_key_start + sec2mono(50) < timestamp ?
+                          sec2mono(10) : timestamp - dr->dr_key_start;
     dr->dr_key_start = timestamp;
   } else {
     /* We don't know the exact start key switch time */
-    dr->dr_key_start = timestamp - 60;
+    dr->dr_key_start = timestamp - sec2mono(60);
   }
 }
 
 static inline int
-key_changed ( th_descrambler_runtime_t *dr, uint8_t ki, time_t timestamp )
+key_changed ( th_descrambler_runtime_t *dr, uint8_t ki, int64_t timestamp )
 {
   return dr->dr_key_index != (ki & 0x40) &&
-         dr->dr_key_start + 2 < timestamp;
+         dr->dr_key_start + sec2mono(2) < timestamp;
 }
 
 static inline int
@@ -562,7 +605,7 @@ key_valid ( th_descrambler_runtime_t *dr, uint8_t ki )
 }
 
 static inline int
-key_late( th_descrambler_runtime_t *dr, uint8_t ki, time_t timestamp )
+key_late( th_descrambler_runtime_t *dr, uint8_t ki, int64_t timestamp )
 {
   uint8_t kidx = (ki & 0x40) >> 6;
   /* constcw - do not handle keys */
@@ -575,7 +618,7 @@ key_late( th_descrambler_runtime_t *dr, uint8_t ki, time_t timestamp )
       goto late;
   }
   /* ECM was sent, but no new key was received */
-  if (dr->dr_ecm_last_key_time + 2 < dr->dr_key_start &&
+  if (dr->dr_ecm_last_key_time + sec2mono(2) < dr->dr_key_start &&
       (!dr->dr_quick_ecm || dr->dr_ecm_start[kidx] + 4 < dr->dr_key_start)) {
 late:
     dr->dr_key_valid &= ~((ki & 0x40) + 0x40);
@@ -588,7 +631,7 @@ static inline int
 key_started( th_descrambler_runtime_t *dr, uint8_t ki )
 {
   uint8_t kidx = (ki & 0x40) >> 6;
-  return (int64_t)dispatch_clock - (int64_t)dr->dr_ecm_start[kidx] < 5;
+  return mclk() - dr->dr_ecm_start[kidx] < sec2mono(5);
 }
 
 static int
@@ -662,7 +705,7 @@ descrambler_descramble ( service_t *t,
 
     /* process the queued TS packets */
     if (dr->dr_queue_total > 0) {
-      descrambler_data_time_flush(dr, dispatch_clock - (dr->dr_key_interval - 2));
+      descrambler_data_time_flush(dr, mclk() - (dr->dr_key_interval - sec2mono(2)));
       for (dd = TAILQ_FIRST(&dr->dr_queue); dd; dd = dd_next) {
         dd_next = TAILQ_NEXT(dd, dd_link);
         sb = &dd->dd_sbuf;
@@ -678,6 +721,7 @@ descrambler_descramble ( service_t *t,
                                       (ki & 0x40) ? "odd" : "even",
                                       ((mpegts_service_t *)t)->s_dvb_svcname);
               if (key_late(dr, ki, dd->dd_timestamp)) {
+                descrambler_notify_nokey(dr);
                 if (ecm_reset(t, dr)) {
                   descrambler_data_cut(dr, tsb2 - sb->sb_data);
                   flush_data = 1;
@@ -707,20 +751,21 @@ descrambler_descramble ( service_t *t,
                                  "even stream key is not valid");
         goto next;
       }
-      if (key_changed(dr, ki, dispatch_clock)) {
+      if (key_changed(dr, ki, mclk())) {
         tvhtrace("descrambler", "stream key changed to %s for service \"%s\"",
                                 (ki & 0x40) ? "odd" : "even",
                                 ((mpegts_service_t *)t)->s_dvb_svcname);
-        if (key_late(dr, ki, dispatch_clock)) {
-          tvherror("descrambler", "ECM - key late (%ld seconds) for service \"%s\"",
-                                  dispatch_clock - dr->dr_ecm_last_key_time,
+        if (key_late(dr, ki, mclk())) {
+          tvherror("descrambler", "ECM - key late (%"PRId64" ms) for service \"%s\"",
+                                  mono2ms(mclk() - dr->dr_ecm_last_key_time),
                                   ((mpegts_service_t *)t)->s_dvb_svcname);
+          descrambler_notify_nokey(dr);
           if (ecm_reset(t, dr)) {
             flush_data = 1;
             goto next;
           }
         }
-        key_update(dr, ki, dispatch_clock);
+        key_update(dr, ki, mclk());
       }
     }
     dr->dr_skip = 1;
@@ -729,6 +774,12 @@ descrambler_descramble ( service_t *t,
     return 1;
   }
 next:
+  if (!dr->dr_skip) {
+    if (!dr->dr_force_skip)
+      dr->dr_force_skip = mclk() + sec2mono(30);
+    else if (dr->dr_force_skip < mclk())
+      dr->dr_skip = 1;
+  }
   if (dr->dr_ecm_start[0] || dr->dr_ecm_start[1]) { /* ECM sent */
     ki = tsb[3];
     if ((ki & 0x80) != 0x00) {
@@ -739,18 +790,18 @@ next:
             tvhtrace("descrambler", "initial stream key set to %s for service \"%s\"",
                                     (ki & 0x40) ? "odd" : "even",
                                     ((mpegts_service_t *)t)->s_dvb_svcname);
-            key_update(dr, ki, dispatch_clock);
+            key_update(dr, ki, mclk());
             break;
           } else {
             descrambler_data_cut(dr, 188);
           }
         }
       } else if (dr->dr_key_index != (ki & 0x40) &&
-                 dr->dr_key_start + 2 < dispatch_clock) {
+                 dr->dr_key_start + sec2mono(2) < mclk()) {
         tvhtrace("descrambler", "stream key changed to %s for service \"%s\"",
                                 (ki & 0x40) ? "odd" : "even",
                                 ((mpegts_service_t *)t)->s_dvb_svcname);
-        key_update(dr, ki, dispatch_clock);
+        key_update(dr, ki, mclk());
       }
     }
     if (count != failed) {
@@ -761,8 +812,8 @@ next:
       dbuflen = MAX(300, config.descrambler_buffer);
       if (dr->dr_queue_total >= dbuflen * 188) {
         descrambler_data_cut(dr, MAX((dbuflen / 10) * 188, len));
-        if (dr->dr_last_err + 10 < dispatch_clock) {
-          dr->dr_last_err = dispatch_clock;
+        if (dr->dr_last_err + sec2mono(10) < mclk()) {
+          dr->dr_last_err = mclk();
           tvherror("descrambler", "cannot decode packets for service \"%s\"",
                    ((mpegts_service_t *)t)->s_dvb_svcname);
         } else {
@@ -774,6 +825,8 @@ next:
       service_set_streaming_status_flags(t, TSS_NO_ACCESS);
     }
   } else {
+    if (dr->dr_skip || count == 0)
+      ts_skip_packet2((mpegts_service_t *)dr->dr_service, tsb, len);
     service_set_streaming_status_flags(t, TSS_NO_ACCESS);
   }
   if (flush_data)
@@ -834,7 +887,7 @@ descrambler_table_callback
                          t->s_dvb_svcname);
             }
             if ((ptr[0] & 0xfe) == 0x80) { /* 0x80 = even, 0x81 = odd */
-              dr->dr_ecm_start[ptr[0] & 1] = dispatch_clock;
+              dr->dr_ecm_start[ptr[0] & 1] = mclk();
               if (dr->dr_quick_ecm)
                 dr->dr_key_valid &= ~(1 << ((ptr[0] & 1) + 6)); /* 0x40 = even, 0x80 = odd */
             }

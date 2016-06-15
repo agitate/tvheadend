@@ -16,6 +16,7 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -68,47 +69,60 @@ struct imagecache_config imagecache_conf = {
   .idnode.in_class = &imagecache_class,
 };
 
-static void imagecache_save(idnode_t *self);
+static htsmsg_t *imagecache_save(idnode_t *self, char *filename, size_t fsize);
+
+CLASS_DOC(imagecache)
 
 const idclass_t imagecache_class = {
   .ic_snode      = (idnode_t *)&imagecache_conf,
   .ic_class      = "imagecache",
-  .ic_caption    = N_("Image cache"),
+  .ic_caption    = N_("Configuration - Image Cache"),
   .ic_event      = "imagecache",
   .ic_perm_def   = ACCESS_ADMIN,
+  .ic_doc        = tvh_doc_imagecache_class,
   .ic_save       = imagecache_save,
   .ic_properties = (const property_t[]){
     {
       .type   = PT_BOOL,
       .id     = "enabled",
       .name   = N_("Enabled"),
+      .desc   = N_("Select whether or not to enable caching. Note: "
+                   "even with this disabled you can still specify "
+                   "local (file://) icons and these will be served by "
+                   "the built-in webserver."),
       .off    = offsetof(struct imagecache_config, enabled),
     },
     {
       .type   = PT_BOOL,
       .id     = "ignore_sslcert",
       .name   = N_("Ignore invalid SSL certificate"),
+      .desc   = N_("Ignore invalid/unverifiable (expired, "
+                   "self-certified, etc.) certificates"),
       .off    = offsetof(struct imagecache_config, ignore_sslcert),
     },
     {
       .type   = PT_U32,
       .id     = "ok_period",
       .name   = N_("Re-fetch period (hours)"),
+      .desc   = N_("How frequently the upstream provider is checked "
+                   "for changes."),
       .off    = offsetof(struct imagecache_config, ok_period),
     },
     {
       .type   = PT_U32,
       .id     = "fail_period",
       .name   = N_("Re-try period (hours)"),
+      .desc   = N_("How frequently it will re-try fetching an image "
+                   "that has failed to be fetched."),
       .off    = offsetof(struct imagecache_config, fail_period),
     },
     {}
   }
 };
 
-static pthread_cond_t                 imagecache_cond;
+static tvh_cond_t                     imagecache_cond;
 static TAILQ_HEAD(, imagecache_image) imagecache_queue;
-static gtimer_t                       imagecache_timer;
+static mtimer_t                       imagecache_timer;
 #endif
 
 static int
@@ -168,7 +182,7 @@ imagecache_image_add ( imagecache_image_t *img )
   if (strncasecmp("file://", img->url, 7)) {
     img->state = QUEUED;
     TAILQ_INSERT_TAIL(&imagecache_queue, img, q_link);
-    pthread_cond_broadcast(&imagecache_cond);
+    tvh_cond_signal(&imagecache_cond, 1);
   } else {
     time(&img->updated);
   }
@@ -241,7 +255,7 @@ imagecache_image_fetch ( imagecache_image_t *img )
   char tpath[PATH_MAX] = "", path[PATH_MAX];
   tvhpoll_event_t ev;
   tvhpoll_t *efd = NULL;
-  http_client_t *hc;
+  http_client_t *hc = NULL;
 
   lock_assert(&global_lock);
 
@@ -284,7 +298,7 @@ imagecache_image_fetch ( imagecache_image_t *img )
   if (r < 0)
     goto error_lock;
 
-  while (tvheadend_running) {
+  while (tvheadend_is_running()) {
     r = tvhpoll_wait(efd, &ev, 1, -1);
     if (r < 0)
       break;
@@ -305,6 +319,7 @@ imagecache_image_fetch ( imagecache_image_t *img )
 error_lock:
   pthread_mutex_lock(&global_lock);
 error:
+  if (NULL != hc) http_client_close(hc);
   urlreset(&url);
   tvhpoll_destroy(efd);
   img->state = IDLE;
@@ -318,7 +333,7 @@ error:
   } else {
     tvhdebug("imagecache", "downloaded %s", img->url);
   }
-  pthread_cond_broadcast(&imagecache_cond);
+  tvh_cond_signal(&imagecache_cond, 1);
 
   return res;
 };
@@ -329,17 +344,17 @@ imagecache_thread ( void *p )
   imagecache_image_t *img;
 
   pthread_mutex_lock(&global_lock);
-  while (tvheadend_running) {
+  while (tvheadend_is_running()) {
 
     /* Check we're enabled */
     if (!imagecache_conf.enabled) {
-      pthread_cond_wait(&imagecache_cond, &global_lock);
+      tvh_cond_wait(&imagecache_cond, &global_lock);
       continue;
     }
 
     /* Get entry */
     if (!(img = TAILQ_FIRST(&imagecache_queue))) {
-      pthread_cond_wait(&imagecache_cond, &global_lock);
+      tvh_cond_wait(&imagecache_cond, &global_lock);
       continue;
     }
 
@@ -396,11 +411,13 @@ imagecache_init ( void )
   imagecache_conf.ok_period      = 24 * 7; // weekly
   imagecache_conf.fail_period    = 24;     // daily
   imagecache_conf.ignore_sslcert = 0;
+
+  idclass_register(&imagecache_class);
 #endif
 
   /* Create threads */
 #if ENABLE_IMAGECACHE
-  pthread_cond_init(&imagecache_cond, NULL);
+  tvh_cond_init(&imagecache_cond);
   TAILQ_INIT(&imagecache_queue);
 #endif
 
@@ -451,7 +468,7 @@ imagecache_init ( void )
   // TODO: this could be more efficient by being targetted, however
   //       the reality its not necessary and I'd prefer to avoid dumping
   //       100's of timers into the global pool
-  gtimer_arm(&imagecache_timer, imagecache_timer_cb, NULL, 600);
+  mtimer_arm_rel(&imagecache_timer, imagecache_timer_cb, NULL, sec2mono(600));
 #endif
 }
 
@@ -481,7 +498,8 @@ imagecache_done ( void )
   imagecache_image_t *img;
 
 #if ENABLE_IMAGECACHE
-  pthread_cond_broadcast(&imagecache_cond);
+  mtimer_disarm(&imagecache_timer);
+  tvh_cond_signal(&imagecache_cond, 1);
   pthread_join(imagecache_tid, NULL);
 #endif
   while ((img = RB_FIRST(&imagecache_by_id)) != NULL)
@@ -495,14 +513,14 @@ imagecache_done ( void )
 /*
  * Save
  */
-static void
-imagecache_save ( idnode_t *self )
+static htsmsg_t *
+imagecache_save ( idnode_t *self, char *filename, size_t fsize )
 {
   htsmsg_t *c = htsmsg_create_map();
   idnode_save(&imagecache_conf.idnode, c);
-  hts_settings_save(c, "imagecache/config");
-  htsmsg_destroy(c);
-  pthread_cond_broadcast(&imagecache_cond);
+  snprintf(filename, fsize, "imagecache/config");
+  tvh_cond_signal(&imagecache_cond, 1);
+  return c;
 }
 
 /*
@@ -627,6 +645,7 @@ int
 imagecache_open ( uint32_t id )
 {
   imagecache_image_t skel, *i;
+  char *fn;
   int fd = -1;
 
   lock_assert(&global_lock);
@@ -637,26 +656,29 @@ imagecache_open ( uint32_t id )
     return -1;
 
   /* Local file */
-  if (!strncasecmp(i->url, "file://", 7))
-    fd = open(i->url + 7, O_RDONLY);
+  if (!strncasecmp(i->url, "file://", 7)) {
+    fn = strdupa(i->url + 7);
+    http_deescape(fn);
+    fd = open(fn, O_RDONLY);
+  }
 
   /* Remote file */
 #if ENABLE_IMAGECACHE
   else if (imagecache_conf.enabled) {
     int e;
-    struct timespec ts;
+    int64_t mono;
 
     /* Use existing */
     if (i->updated) {
 
     /* Wait */
     } else if (i->state == FETCHING) {
-      time(&ts.tv_sec);
-      ts.tv_nsec = 0;
-      ts.tv_sec += 5;
-      e = pthread_cond_timedwait(&imagecache_cond, &global_lock, &ts);
-      if (e == ETIMEDOUT)
-        return -1;
+      mono = mclk() + sec2mono(5);
+      do {
+        e = tvh_cond_timedwait(&imagecache_cond, &global_lock, mono);
+        if (e == ETIMEDOUT)
+          return -1;
+      } while (ERRNO_AGAIN(e));
 
     /* Attempt to fetch */
     } else if (i->state == QUEUED) {

@@ -22,6 +22,8 @@
 #include "idnode.h"
 #include "queue.h"
 
+struct htsmsg;
+
 /*
  * Type-defs
  */
@@ -87,6 +89,8 @@ struct tvh_input {
 
   void (*ti_get_streams) (tvh_input_t *, tvh_input_stream_list_t*);
   void (*ti_clear_stats) (tvh_input_t *);
+  struct htsmsg *(*ti_wizard_get) (tvh_input_t *, const char *);
+  void (*ti_wizard_set)  (tvh_input_t *, struct htsmsg *, const char *);
 };
 
 /*
@@ -97,6 +101,7 @@ struct tvh_input_instance {
 
   LIST_ENTRY(tvh_input_instance) tii_input_link;
 
+  pthread_mutex_t          tii_stats_mutex;
   tvh_input_stream_stats_t tii_stats;
 
   void (*tii_delete) (tvh_input_instance_t *tii);
@@ -110,6 +115,8 @@ struct tvh_hardware {
   idnode_t                     th_id;
   LIST_ENTRY(tvh_hardware)     th_link;
 };
+
+void tvh_hardware_init(void);
 
 void *tvh_hardware_create0
   ( void *o, const idclass_t *idc, const char *uuid, htsmsg_t *conf );
@@ -130,8 +137,6 @@ tvh_hardware_list_t tvh_hardware;
 /*
  * Methods
  */
-
-void input_init ( void );
 
 htsmsg_t * tvh_input_stream_create_msg ( tvh_input_stream_t *st );
 

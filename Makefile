@@ -28,11 +28,19 @@ LANGUAGES ?= bg cs da de en_US en_GB es et fa fi fr he hr hu it lv nl pl pt ru s
 # Common compiler flags
 #
 
-CFLAGS  += -g -O2
+CFLAGS  += -g -O2 -fPIE
+ifeq ($(CONFIG_PIE),yes)
+CFLAGS  += -fPIE
+else
+CFLAGS  += -fPIC
+endif
 ifeq ($(CONFIG_W_UNUSED_RESULT),yes)
 CFLAGS  += -Wunused-result
 endif
-CFLAGS  += -Wall -Werror -Wwrite-strings -Wno-deprecated-declarations
+ifneq ($(CFLAGS_NO_WERROR),yes)
+CFLAGS  += -Werror
+endif
+CFLAGS  += -Wall -Wwrite-strings -Wno-deprecated-declarations
 CFLAGS  += -Wmissing-prototypes
 CFLAGS  += -fms-extensions -funsigned-char -fno-strict-aliasing
 CFLAGS  += -D_FILE_OFFSET_BITS=64
@@ -42,6 +50,7 @@ LDFLAGS += -ldl -lm
 else
 LDFLAGS += -ldl -lpthread -lm
 endif
+LDFLAGS += -pie -Wl,-z,now
 ifeq ($(CONFIG_LIBICONV),yes)
 LDFLAGS += -liconv
 endif
@@ -59,62 +68,87 @@ CFLAGS  += -Wno-unused-value -Wno-tautological-constant-out-of-range-compare
 CFLAGS  += -Wno-parentheses-equality -Wno-incompatible-pointer-types
 endif
 
-ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
 
-CFLAGS  += -I${ROOTDIR}/libav_static/build/ffmpeg/include
-LDFLAGS_FFDIR = ${ROOTDIR}/libav_static/build/ffmpeg/lib
-LDFLAGS += ${LDFLAGS_FFDIR}/libavresample.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libswresample.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libavfilter.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libswscale.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libavutil.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libavformat.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libavcodec.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libavutil.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libvorbisenc.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libvorbis.a
-LDFLAGS += ${LDFLAGS_FFDIR}/libogg.a
+# LIBAV ########################################################################
+
+ifeq ($(CONFIG_LIBAV),yes)
+
+FFMPEG_LIBS := \
+    libavfilter \
+    libswresample \
+    libavresample \
+    libswscale \
+    libavformat \
+    libavcodec \
+    libavutil
+
+# FFMPEG_STATIC
+ifeq ($(CONFIG_FFMPEG_STATIC),yes)
+
+ifeq (,$(wildcard ${BUILDDIR}/libffmpeg_stamp))
+# build static FFMPEG as first for pkgconfig
+ffmpeg_all: ${BUILDDIR}/libffmpeg_stamp
+	$(MAKE) all
+endif
+
+FFMPEG_PREFIX := $(BUILDDIR)/ffmpeg/build/ffmpeg
+FFMPEG_LIBDIR := $(FFMPEG_PREFIX)/lib
+FFMPEG_CONFIG := \
+    PKG_CONFIG_LIBDIR=$(FFMPEG_LIBDIR)/pkgconfig $(PKG_CONFIG) \
+    --define-variable=prefix=$(FFMPEG_PREFIX) --static
 
 ifeq ($(CONFIG_LIBX264_STATIC),yes)
-LDFLAGS += ${LDFLAGS_FFDIR}/libx264.a -ldl
-else
-LDFLAGS += -lx264 -ldl
+FFMPEG_DEPS += libx264
 endif
 
-ifeq ($(CONFIG_LIBX265),yes)
 ifeq ($(CONFIG_LIBX265_STATIC),yes)
-LDFLAGS += ${LDFLAGS_FFDIR}/libx265.a -lstdc++
-else
-LDFLAGS += -lx265
-endif
+FFMPEG_DEPS += libx265
 endif
 
-LDFLAGS += ${LDFLAGS_FFDIR}/libvpx.a
-
-CONFIG_LIBMFX_VA_LIBS =
-
-ifeq ($(CONFIG_LIBMFX),yes)
-CONFIG_LIBMFX_VA_LIBS += -lva
-ifeq ($(CONFIG_VA_DRM),yes)
-CONFIG_LIBMFX_VA_LIBS += -lva-drm
+ifeq ($(CONFIG_LIBVPX_STATIC),yes)
+FFMPEG_DEPS += libvpx
 endif
-ifeq ($(CONFIG_VA_X11),yes)
-CONFIG_LIBMFX_VA_LIBS += -lva-x11
+
+ifeq ($(CONFIG_LIBOGG_STATIC),yes)
+FFMPEG_DEPS += libogg
 endif
+
+ifeq ($(CONFIG_LIBTHEORA_STATIC),yes)
+FFMPEG_DEPS += libtheoraenc libtheoradec libtheora
+endif
+
+ifeq ($(CONFIG_LIBVORBIS_STATIC),yes)
+FFMPEG_DEPS += libvorbisfile libvorbisenc libvorbis
+endif
+
+ifeq ($(CONFIG_LIBFDKAAC_STATIC),yes)
+FFMPEG_DEPS += libfdk-aac
+endif
+
 ifeq ($(CONFIG_LIBMFX_STATIC),yes)
-LDFLAGS += ${LDFLAGS_FFDIR}/libmfx.a -lstdc++
-else
-LDFLAGS += -lmfx
-endif
-LDFLAGS += ${CONFIG_LIBMFX_VA_LIBS}
+FFMPEG_DEPS += libmfx
 endif
 
-endif # CONFIG_LIBFFMPEG_STATIC
+LDFLAGS += $(foreach lib,$(FFMPEG_LIBS),$(FFMPEG_LIBDIR)/$(lib).a)
+LDFLAGS += $(foreach lib,$(FFMPEG_DEPS),$(FFMPEG_LIBDIR)/$(lib).a)
+
+else # !FFMPEG_STATIC
+
+FFMPEG_CONFIG := $(PKG_CONFIG)
+
+endif # FFMPEG_STATIC
+
+CFLAGS  += `$(FFMPEG_CONFIG) --cflags $(FFMPEG_LIBS)`
+LDFLAGS += `$(FFMPEG_CONFIG) --libs $(FFMPEG_LIBS)`
+
+endif
+
+# LIBAV ########################################################################
+
 
 ifeq ($(CONFIG_HDHOMERUN_STATIC),yes)
-CFLAGS  += -I${ROOTDIR}/libhdhomerun_static
-LDFLAGS += -L${ROOTDIR}/libhdhomerun_static/libhdhomerun \
-           -Wl,-Bstatic -lhdhomerun -Wl,-Bdynamic
+CFLAGS  += -I$(BUILDDIR)/hdhomerun
+LDFLAGS += $(BUILDDIR)/hdhomerun/libhdhomerun/libhdhomerun.a
 endif
 
 vpath %.c $(ROOTDIR)
@@ -132,19 +166,22 @@ BUNDLE_FLAGS = ${BUNDLE_FLAGS-yes}
 #
 
 MKBUNDLE = $(PYTHON) $(ROOTDIR)/support/mkbundle
-XGETTEXT2 ?= $(XGETTEXT) --language=C --add-comments=/ -k_ -kN_ -s
+XGETTEXT2 ?= $(XGETTEXT) --language=C --from-code=utf-8 --add-comments=/ -k_ -kN_ -s
 MSGMERGE ?= msgmerge
 
 #
 # Debug/Output
 #
 
+BRIEF  = CC MKBUNDLE
 ifndef V
 ECHO   = printf "%-16s%s\n" $(1) $(2)
-BRIEF  = CC MKBUNDLE CXX
 MSG    = $(subst $(BUILDDIR)/,,$@)
 $(foreach VAR,$(BRIEF), \
-	$(eval $(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
+	$(eval p$(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
+else
+$(foreach VAR,$(BRIEF), \
+	$(eval p$(VAR) = $($(VAR))))
 endif
 
 #
@@ -186,9 +223,8 @@ SRCS-1 = \
 	src/settings.c \
 	src/htsbuf.c \
 	src/trap.c \
-	src/avg.c \
 	src/htsstr.c \
-        src/tvhpoll.c \
+	src/tvhpoll.c \
 	src/huffman.c \
 	src/filebundle.c \
 	src/config.c \
@@ -207,7 +243,9 @@ SRCS-1 = \
 	src/intlconv.c \
 	src/profile.c \
 	src/bouquet.c \
-	src/lock.c
+	src/lock.c \
+	src/wizard.c \
+	src/memoryinfo.c
 SRCS = $(SRCS-1)
 I18N-C = $(SRCS-1)
 
@@ -249,7 +287,8 @@ SRCS-2 = \
 	src/api/api_bouquet.c \
 	src/api/api_language.c \
 	src/api/api_satip.c \
-	src/api/api_timeshift.c
+	src/api/api_timeshift.c \
+	src/api/api_wizard.c
 
 SRCS-2 += \
 	src/parsers/parsers.c \
@@ -258,13 +297,13 @@ SRCS-2 += \
 	src/parsers/parser_hevc.c \
 	src/parsers/parser_latm.c \
 	src/parsers/parser_avc.c \
-	src/parsers/parser_teletext.c \
+	src/parsers/parser_teletext.c
 
 SRCS-2 += \
-	src/epggrab/module.c\
-	src/epggrab/channel.c\
-	src/epggrab/module/pyepg.c\
-	src/epggrab/module/xmltv.c\
+	src/epggrab/module.c \
+	src/epggrab/channel.c \
+	src/epggrab/module/pyepg.c \
+	src/epggrab/module/xmltv.c
 
 SRCS-2 += \
 	src/plumbing/tsfix.c \
@@ -285,9 +324,10 @@ SRCS-2 += \
 	src/webui/extjs.c \
 	src/webui/simpleui.c \
 	src/webui/statedump.c \
-	src/webui/html.c\
-	src/webui/webui_api.c\
-	src/webui/xmltv.c
+	src/webui/html.c \
+	src/webui/webui_api.c \
+	src/webui/xmltv.c \
+	src/webui/doc_md.c
 
 SRCS-2 += \
 	src/muxer.c \
@@ -327,9 +367,9 @@ I18N-C += $(SRCS-MPEGTS)
 
 # MPEGTS DVB
 SRCS-MPEGTS-DVB = \
-        src/input/mpegts/mpegts_network_dvb.c \
-        src/input/mpegts/mpegts_mux_dvb.c \
-        src/input/mpegts/scanfile.c
+	src/input/mpegts/mpegts_network_dvb.c \
+	src/input/mpegts/mpegts_mux_dvb.c \
+	src/input/mpegts/scanfile.c
 SRCS-${CONFIG_MPEGTS_DVB} += $(SRCS-MPEGTS-DVB)
 I18N-C += $(SRCS-MPEGTS-DVB)
 
@@ -345,14 +385,14 @@ I18N-C += $(SRCS-MPEGTS-EPG)
 
 # LINUX DVB
 SRCS-LINUXDVB = \
-        src/input/mpegts/linuxdvb/linuxdvb.c \
-        src/input/mpegts/linuxdvb/linuxdvb_adapter.c \
-        src/input/mpegts/linuxdvb/linuxdvb_frontend.c \
-        src/input/mpegts/linuxdvb/linuxdvb_satconf.c \
-        src/input/mpegts/linuxdvb/linuxdvb_lnb.c \
-        src/input/mpegts/linuxdvb/linuxdvb_switch.c \
-        src/input/mpegts/linuxdvb/linuxdvb_rotor.c \
-        src/input/mpegts/linuxdvb/linuxdvb_en50494.c
+	src/input/mpegts/linuxdvb/linuxdvb.c \
+	src/input/mpegts/linuxdvb/linuxdvb_adapter.c \
+	src/input/mpegts/linuxdvb/linuxdvb_frontend.c \
+	src/input/mpegts/linuxdvb/linuxdvb_satconf.c \
+	src/input/mpegts/linuxdvb/linuxdvb_lnb.c \
+	src/input/mpegts/linuxdvb/linuxdvb_switch.c \
+	src/input/mpegts/linuxdvb/linuxdvb_rotor.c \
+	src/input/mpegts/linuxdvb/linuxdvb_en50494.c
 SRCS-${CONFIG_LINUXDVB} += $(SRCS-LINUXDVB)
 I18N-C += $(SRCS-LINUXDVB)
 
@@ -367,31 +407,31 @@ I18N-C += $(SRCS-SATIP-CLIENT)
 
 # HDHOMERUN
 SRCS-HDHOMERUN = \
-        src/input/mpegts/tvhdhomerun/tvhdhomerun.c \
-        src/input/mpegts/tvhdhomerun/tvhdhomerun_frontend.c
+	src/input/mpegts/tvhdhomerun/tvhdhomerun.c \
+	src/input/mpegts/tvhdhomerun/tvhdhomerun_frontend.c
 SRCS-${CONFIG_HDHOMERUN_CLIENT} += $(SRCS-HDHOMERUN)
 I18N-C += $(SRCS-HDHOMERUN)
 
 # IPTV
 SRCS-IPTV = \
 	src/input/mpegts/iptv/iptv.c \
-        src/input/mpegts/iptv/iptv_mux.c \
-        src/input/mpegts/iptv/iptv_service.c \
-        src/input/mpegts/iptv/iptv_http.c \
-        src/input/mpegts/iptv/iptv_udp.c \
-        src/input/mpegts/iptv/iptv_rtsp.c \
-        src/input/mpegts/iptv/iptv_rtcp.c \
-        src/input/mpegts/iptv/iptv_pipe.c \
-        src/input/mpegts/iptv/iptv_file.c \
+	src/input/mpegts/iptv/iptv_mux.c \
+	src/input/mpegts/iptv/iptv_service.c \
+	src/input/mpegts/iptv/iptv_http.c \
+	src/input/mpegts/iptv/iptv_udp.c \
+	src/input/mpegts/iptv/iptv_rtsp.c \
+	src/input/mpegts/iptv/iptv_rtcp.c \
+	src/input/mpegts/iptv/iptv_pipe.c \
+	src/input/mpegts/iptv/iptv_file.c \
 	src/input/mpegts/iptv/iptv_auto.c
 SRCS-${CONFIG_IPTV} += $(SRCS-IPTV)
 I18N-C += $(SRCS-IPTV)
 
 # TSfile
 SRCS-TSFILE = \
-        src/input/mpegts/tsfile/tsfile.c \
-        src/input/mpegts/tsfile/tsfile_input.c \
-        src/input/mpegts/tsfile/tsfile_mux.c
+	src/input/mpegts/tsfile/tsfile.c \
+	src/input/mpegts/tsfile/tsfile_input.c \
+	src/input/mpegts/tsfile/tsfile_mux.c
 SRCS-$(CONFIG_TSFILE) += $(SRCS-TSFILE)
 I18N-C += $(SRCS-TSFILE)
 
@@ -445,7 +485,7 @@ SRCS-CWC = \
 	src/descrambler/emm_reass.c
 SRCS-${CONFIG_CWC} += $(SRCS-CWC)
 I18N-C += $(SRCS-CWC)
-	
+
 # CAPMT
 SRCS-CAPMT = \
 	src/descrambler/capmt.c
@@ -480,7 +520,7 @@ endif
 
 ifeq ($(FFDECSA-yes),yes)
 SRCS-yes += src/descrambler/ffdecsa/ffdecsa_interface.c \
-	    src/descrambler/ffdecsa/ffdecsa_int.c
+	src/descrambler/ffdecsa/ffdecsa_int.c
 SRCS-${CONFIG_MMX}  += src/descrambler/ffdecsa/ffdecsa_mmx.c
 SRCS-${CONFIG_SSE2} += src/descrambler/ffdecsa/ffdecsa_sse2.c
 ${BUILDDIR}/src/descrambler/ffdecsa/ffdecsa_mmx.o  : CFLAGS += -mmmx
@@ -495,28 +535,39 @@ SRCS-${CONFIG_DBUS_1}  += src/dbus.c
 
 # File bundles
 SRCS-${CONFIG_BUNDLE}     += bundle.c
-BUNDLES-yes               += docs/html docs/docresources src/webui/static
+BUNDLES-yes               += src/webui/static
 BUNDLES-yes               += data/conf
 BUNDLES-${CONFIG_DVBSCAN} += data/dvb-scan
 BUNDLES                    = $(BUNDLES-yes)
 ALL-$(CONFIG_DVBSCAN)     += check_dvb_scan
 
 #
+# Documentation
+#
+
+MD-TO-C    = PYTHONIOENCODING=utf-8 $(PYTHON) support/doc/md_to_c.py
+
+SRCS-yes   += src/docs.c
+I18N-C-DOCS = src/docs_inc.c
+I18N-DOCS   = $(wildcard docs/markdown/*.md)
+I18N-DOCS  += $(wildcard docs/markdown/inc/*.md)
+I18N-DOCS  += $(wildcard docs/class/*.md)
+I18N-DOCS  += $(wildcard docs/property/*.md)
+I18N-DOCS  += $(wildcard docs/wizard/*.md)
+MD-ROOT     = $(patsubst docs/markdown/%.md,%,$(wildcard docs/markdown/*.md))
+MD-ROOT    += $(patsubst docs/markdown/inc/%.md,inc/%,$(wildcard docs/markdown/inc/*.md))
+MD-CLASS    = $(patsubst docs/class/%.md,%,$(wildcard docs/class/*.md))
+MD-PROP     = $(patsubst docs/property/%.md,%,$(wildcard docs/property/*.md))
+MD-WIZARD   = $(patsubst docs/wizard/%.md,%,$(wildcard docs/wizard/*.md))
+
+#
 # Internationalization
 #
-PO-FILES = $(foreach f,$(LANGUAGES),intl/tvheadend.$(f).po)
+PO-FILES  = $(wildcard $(foreach f,$(LANGUAGES),intl/tvheadend.$(f).po))
+PO-FILES += $(wildcard $(foreach f,$(LANGUAGES-DOC),intl/docs/tvheadend.doc.$(f).po))
 SRCS += src/tvh_locale.c
 
 POC_PY=PYTHONIOENCODING=utf-8 $(PYTHON) support/poc.py
-
-define merge-po
-	@if ! test -r "$(1)"; then \
-	  sed -e 's/Content-Type: text\/plain; charset=CHARSET/Content-Type: text\/plain; charset=utf-8/' < "$(2)" > "$(1).new"; \
-	else \
-	  $(MSGMERGE) -o $(1).new $(1) $(2); \
-	fi
-	@mv $(1).new $(1)
-endef
 
 #
 # Add-on modules
@@ -533,7 +584,7 @@ OBJS       = $(SRCS:%.c=$(BUILDDIR)/%.o)
 OBJS_EXTRA = $(SRCS_EXTRA:%.c=$(BUILDDIR)/%.so)
 DEPS       = ${OBJS:%.o=%.d}
 
-ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+ifeq ($(CONFIG_FFMPEG_STATIC),yes)
 ALL-yes   += ${BUILDDIR}/libffmpeg_stamp
 endif
 ifeq ($(CONFIG_HDHOMERUN_STATIC),yes)
@@ -562,17 +613,17 @@ reconfigure:
 
 # Binary
 ${PROG}: .config.mk make_webui $(OBJS)
-	$(CC) -o $@ $(OBJS) $(CFLAGS) $(LDFLAGS)
+	$(pCC) -o $@ $(OBJS) $(CFLAGS) $(LDFLAGS)
 
 # Object
 ${BUILDDIR}/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) -MD -MP $(CFLAGS) -c -o $@ $<
+	$(pCC) -MD -MP $(CFLAGS) -c -o $@ $<
 
 # Add-on
 ${BUILDDIR}/%.so: ${SRCS_EXTRA}
 	@mkdir -p $(dir $@)
-	${CC} -O -fbuiltin -fomit-frame-pointer -fPIC -shared -o $@ $< -ldl
+	${pCC} -O -fbuiltin -fomit-frame-pointer -fPIC -shared -o $@ $< -ldl
 
 # Clean
 .PHONY: clean
@@ -585,8 +636,6 @@ clean:
 # Distclean
 .PHONY: distclean
 distclean: clean
-	rm -rf ${ROOTDIR}/libav_static
-	rm -rf ${ROOTDIR}/libhdhomerun_static
 	rm -rf ${ROOTDIR}/build.*
 	rm -rf ${ROOTDIR}/data/dvb-scan
 	rm -f ${ROOTDIR}/.config.mk
@@ -613,11 +662,45 @@ $(BUILDDIR)/timestamp.c: FORCE
 	@echo 'const char* build_timestamp = "'`date -Iseconds`'";' >> $@
 
 $(BUILDDIR)/timestamp.o: $(BUILDDIR)/timestamp.c
-	$(CC) -c -o $@ $<
+	$(pCC) -c -o $@ $<
 
 $(BUILDDIR)/build.o: $(BUILDDIR)/build.c
 	@mkdir -p $(dir $@)
-	$(CC) -c -o $@ $<
+	$(pCC) -c -o $@ $<
+
+# Documentation
+$(BUILDDIR)/docs-timestamp: $(I18N-DOCS) support/doc/md_to_c.py
+	@-rm -f src/docs_inc.c
+	@for i in $(MD-ROOT); do \
+	   echo "Markdown: docs/markdown/$${i}.md"; \
+	   $(MD-TO-C) --in="docs/markdown/$${i}.md" \
+	              --name="tvh_doc_root_$${i}" >> src/docs_inc.c || exit 1; \
+	 done
+	@for i in $(MD-CLASS); do \
+	   echo "Markdown: docs/class/$${i}.md"; \
+	   $(MD-TO-C) --in="docs/class/$${i}.md" \
+	              --name="tvh_doc_$${i}_class" >> src/docs_inc.c || exit 1; \
+	 done
+	@for i in $(MD-PROP); do \
+	   echo "Markdown: docs/property/$${i}.md"; \
+	   $(MD-TO-C) --in="docs/property/$${i}.md" \
+	              --name="tvh_doc_$${i}_property" >> src/docs_inc.c || exit 1; \
+	 done
+	@for i in $(MD-WIZARD); do \
+	   echo "Markdown: docs/wizard/$${i}.md"; \
+	   $(MD-TO-C) --in="docs/wizard/$${i}.md" \
+	              --name="tvh_doc_wizard_$${i}" >> src/docs_inc.c || exit 1; \
+	 done
+	@$(MD-TO-C) --pages="$(MD-ROOT)" >> src/docs_inc.c
+	@touch $@
+
+src/docs_inc.c: $(BUILDDIR)/docs-timestamp
+
+src/docs_inc.h: $(BUILDDIR)/docs-timestamp
+
+src/docs.c: src/docs_inc.c src/docs_inc.h
+
+$(BUILDDIR)/src/docs.o: $(BUILDDIR)/docs-timestamp $(I18N-DOCS) support/doc/md_to_c.py
 
 # Internationalization
 .PHONY: intl
@@ -626,36 +709,13 @@ intl:
 	@$(XGETTEXT2) -o intl/tvheadend.pot.new $(I18N-C)
 	@sed -e 's/^"Language: /"Language: en/' < intl/tvheadend.pot.new > intl/tvheadend.pot
 	$(MAKE) -f Makefile.webui LANGUAGES="$(LANGUAGES)" WEBUI=std intl
+	@printf "Building docs/tvheadend.doc.pot\n"
+	@$(XGETTEXT2) -o intl/docs/tvheadend.doc.pot.new $(I18N-C-DOCS)
+	@sed -e 's/^"Language: /"Language: en/' < intl/docs/tvheadend.doc.pot.new > intl/docs/tvheadend.doc.pot
 	$(MAKE)
 
+
 intl/tvheadend.pot:
-
-#intl/tvheadend.en_GB.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.de.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.fr.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.cs.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.pl.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.bg.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.he.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.hr.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
-
-#intl/tvheadend.it.po: intl/tvheadend.pot
-#	$(call merge-po,$@,$<)
 
 $(BUILDDIR)/src/tvh_locale.o: src/tvh_locale_inc.c
 src/tvh_locale_inc.c: $(PO-FILES)
@@ -666,11 +726,11 @@ src/tvh_locale_inc.c: $(PO-FILES)
 # Bundle files
 $(BUILDDIR)/bundle.o: $(BUILDDIR)/bundle.c
 	@mkdir -p $(dir $@)
-	$(CC) -I${ROOTDIR}/src -c -o $@ $<
+	$(pCC) -I${ROOTDIR}/src -c -o $@ $<
 
 $(BUILDDIR)/bundle.c: check_dvb_scan make_webui
 	@mkdir -p $(dir $@)
-	$(MKBUNDLE) -o $@ -d ${BUILDDIR}/bundle.d $(BUNDLE_FLAGS) $(BUNDLES:%=$(ROOTDIR)/%)
+	$(pMKBUNDLE) -o $@ -d ${BUILDDIR}/bundle.d $(BUNDLE_FLAGS) $(BUNDLES:%=$(ROOTDIR)/%)
 
 .PHONY: make_webui
 make_webui:
@@ -678,15 +738,15 @@ make_webui:
 
 # Static FFMPEG
 
-ifeq ($(CONFIG_LIBFFMPEG_STATIC),yes)
+ifeq ($(CONFIG_FFMPEG_STATIC),yes)
 src/libav.h ${SRCS-LIBAV} ${DEPS-LIBAV}: ${BUILDDIR}/libffmpeg_stamp
 endif
 
-${BUILDDIR}/libffmpeg_stamp: ${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a
+${BUILDDIR}/libffmpeg_stamp: ${BUILDDIR}/ffmpeg/build/ffmpeg/lib/libavcodec.a
 	@touch $@
 
-${ROOTDIR}/libav_static/build/ffmpeg/lib/libavcodec.a: Makefile.ffmpeg
-	$(MAKE) -f Makefile.ffmpeg build
+${BUILDDIR}/ffmpeg/build/ffmpeg/lib/libavcodec.a: Makefile.ffmpeg
+	$(MAKE) -f Makefile.ffmpeg
 
 # Static HDHOMERUN library
 
@@ -694,15 +754,15 @@ ifeq ($(CONFIG_LIBHDHOMERUN_STATIC),yes)
 src/input/mpegts/tvhdhomerun/tvhdhomerun_private.h ${SRCS-HDHOMERUN}: ${BUILDDIR}/libhdhomerun_stamp
 endif
 
-${BUILDDIR}/libhdhomerun_stamp: ${ROOTDIR}/libhdhomerun_static/libhdhomerun/libhdhomerun.a
+${BUILDDIR}/libhdhomerun_stamp: ${BUILDDIR}/hdhomerun/libhdhomerun/libhdhomerun.a
 	@touch $@
 
-${ROOTDIR}/libhdhomerun_static/libhdhomerun/libhdhomerun.a: Makefile.hdhomerun
-	$(MAKE) -f Makefile.hdhomerun build
+${BUILDDIR}/hdhomerun/libhdhomerun/libhdhomerun.a: Makefile.hdhomerun
+	$(MAKE) -f Makefile.hdhomerun
 
 # linuxdvb git tree
 $(ROOTDIR)/data/dvb-scan/.stamp:
-	@echo "Receiving data/dvb-scan/dvb-t from http://linuxtv.org/git/dtv-scan-tables.git"
+	@echo "Receiving data/dvb-scan/dvb-t from https://github.com/tvheadend/dtv-scan-tables.git#tvheadend"
 	@rm -rf $(ROOTDIR)/data/dvb-scan/*
 	@$(ROOTDIR)/support/getmuxlist $(ROOTDIR)/data/dvb-scan
 	@touch $@
@@ -717,7 +777,7 @@ $(ROOTDIR)/data/dvb-scan/dvb-s/.stamp: $(ROOTDIR)/data/satellites.xml \
 	@if ! test -s $(ROOTDIR)/data/satellites.xml ; then echo "Put your satellites.xml file to $(ROOTDIR)/data/satellites.xml"; exit 1; fi
 	@if ! test -d $(ROOTDIR)/data/dvb-scan/dvb-s ; then mkdir $(ROOTDIR)/data/dvb-scan/dvb-s ; fi
 	@rm -rf $(ROOTDIR)/data/dvb-scan/dvb-s/*
-	@$(ROOTDIR)/support/sat_xml_scan.py \
+	@PYTHONIOENCODING=utf-8 $(PYTHON) $(ROOTDIR)/support/sat_xml_scan.py \
 		$(ROOTDIR)/data/satellites.xml $(ROOTDIR)/data/dvb-scan/dvb-s
 	@touch $(ROOTDIR)/data/dvb-scan/dvb-s/.stamp
 

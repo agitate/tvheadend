@@ -42,6 +42,7 @@ const static struct strtab typetab[] = {
   { "u16",     PT_U16 },
   { "u32",     PT_U32 },
   { "s64",     PT_S64 },
+  { "s64",     PT_S64_ATOMIC },
   { "dbl",     PT_DBL },
   { "time",    PT_TIME },
   { "langstr", PT_LANGSTR },
@@ -139,13 +140,13 @@ prop_write_values
         break;
       }
       case PT_U32: {
-        if (p->intsplit) {
+        if (p->intextra && INTEXTRA_IS_SPLIT(p->intextra)) {
           char *s;
           if (!(new = htsmsg_field_get_str(f)))
             continue;
-          u32 = atol(new) * p->intsplit;
+          u32 = atol(new) * p->intextra;
           if ((s = strchr(new, '.')) != NULL)
-            u32 += (atol(s + 1) % p->intsplit);
+            u32 += (atol(s + 1) % p->intextra);
         } else {
           if (htsmsg_field_get_u32(f, &u32))
             continue;
@@ -154,10 +155,10 @@ prop_write_values
         break;
       }
       case PT_S64: {
-        if (p->intsplit) {
+        if (p->intextra && INTEXTRA_IS_SPLIT(p->intextra)) {
           if (!(new = htsmsg_field_get_str(f)))
             continue;
-          s64 = prop_intsplit_from_str(new, p->intsplit);
+          s64 = prop_intsplit_from_str(new, p->intextra);
         } else {
           if (htsmsg_field_get_s64(f, &s64))
             continue;
@@ -165,6 +166,8 @@ prop_write_values
         PROP_UPDATE(s64, int64_t);
         break;
       }
+      case PT_S64_ATOMIC:
+        break;
       case PT_DBL: {
         if (htsmsg_field_get_dbl(f, &dbl))
           continue;
@@ -271,7 +274,8 @@ prop_read_value
   /* List */
   if (p->islist) {
     assert(p->get); /* requirement */
-    htsmsg_add_msg(m, name, (htsmsg_t*)val);
+    if (val)
+      htsmsg_add_msg(m, name, (htsmsg_t*)val);
   
   /* Single */
   } else {
@@ -286,9 +290,9 @@ prop_read_value
       htsmsg_add_u32(m, name, *(uint16_t *)val);
       break;
     case PT_U32:
-      if (p->intsplit) {
-        uint32_t maj = *(int64_t *)val / p->intsplit;
-        uint32_t min = *(int64_t *)val % p->intsplit;
+      if (p->intextra && INTEXTRA_IS_SPLIT(p->intextra)) {
+        uint32_t maj = *(int64_t *)val / p->intextra;
+        uint32_t min = *(int64_t *)val % p->intextra;
         if (min) {
           snprintf(buf, sizeof(buf), "%u.%u", (unsigned int)maj, (unsigned int)min);
           htsmsg_add_str(m, name, buf);
@@ -298,9 +302,9 @@ prop_read_value
         htsmsg_add_u32(m, name, *(uint32_t *)val);
       break;
     case PT_S64:
-      if (p->intsplit) {
-        int64_t maj = *(int64_t *)val / p->intsplit;
-        int64_t min = *(int64_t *)val % p->intsplit;
+      if (p->intextra && INTEXTRA_IS_SPLIT(p->intextra)) {
+        int64_t maj = *(int64_t *)val / p->intextra;
+        int64_t min = *(int64_t *)val % p->intextra;
         if (min) {
           snprintf(buf, sizeof(buf), "%lu.%lu", (unsigned long)maj, (unsigned long)min);
           htsmsg_add_str(m, name, buf);
@@ -309,14 +313,13 @@ prop_read_value
       } else
         htsmsg_add_s64(m, name, *(int64_t *)val);
       break;
+    case PT_S64_ATOMIC:
+      htsmsg_add_s64(m, name, atomic_get_s64((int64_t *)val));
+      break;
     case PT_STR:
-      if (optmask & PO_LOCALE) {
-        if ((s = *(const char **)val))
-          htsmsg_add_str(m, name, lang ? tvh_gettext_lang(lang, s) : s);
-      } else {
-        if ((s = *(const char **)val))
-          htsmsg_add_str(m, name, s);
-      }
+      if ((s = *(const char **)val))
+        htsmsg_add_str(m, name, (optmask & PO_LOCALE) != 0 && lang ?
+                                tvh_gettext_lang(lang, s) : s);
       break;
     case PT_DBL:
       htsmsg_add_dbl(m, name, *(double*)val);
@@ -415,6 +418,15 @@ prop_serialize_value
 
   /* Metadata */
   htsmsg_add_str(m, "caption",  tvh_gettext_lang(lang, pl->name));
+  if ((optmask & PO_DOC) && pl->doc) {
+    char *s = pl->doc(pl, lang);
+    if (s) {
+      htsmsg_add_str(m, "doc", s);
+      free(s);
+    }
+  }
+  if (pl->desc)
+    htsmsg_add_str(m, "description", tvh_gettext_lang(lang, pl->desc));
   if (pl->islist) {
     htsmsg_add_u32(m, "list", 1);
     if (pl->def.list)
@@ -435,6 +447,7 @@ prop_serialize_value
         htsmsg_add_u32(m, "default", pl->def.u32);
         break;
       case PT_S64:
+      case PT_S64_ATOMIC:
         htsmsg_add_s64(m, "default", pl->def.s64);
         break;
       case PT_DBL:
@@ -486,6 +499,10 @@ prop_serialize_value
     htsmsg_add_bool(m, "lorder", 1);
   if (opts & PO_MULTILINE)
     htsmsg_add_bool(m, "multiline", 1);
+  if (opts & PO_PERSIST)
+    htsmsg_add_bool(m, "persistent", 1);
+  if ((optmask & PO_DOC) && (opts & PO_DOC_NLIST))
+    htsmsg_add_bool(m, "doc_nlist", 1);
 
   /* Enum list */
   if (pl->list) {
@@ -499,8 +516,15 @@ prop_serialize_value
     htsmsg_add_u32(m, "group", pl->group);
 
   /* Split integer value */
-  if (pl->intsplit)
-    htsmsg_add_u32(m, "intsplit", pl->intsplit);
+  if (pl->intextra) {
+    if (INTEXTRA_IS_SPLIT(pl->intextra))
+      htsmsg_add_u32(m, "intsplit", pl->intextra);
+    else {
+      htsmsg_add_s32(m, "intmax", INTEXTRA_GET_MAX(pl->intextra));
+      htsmsg_add_s32(m, "intmin", INTEXTRA_GET_MIN(pl->intextra));
+      htsmsg_add_s32(m, "intstep", INTEXTRA_GET_STEP(pl->intextra));
+    }
+  }
 
   /* Data */
   if (obj)
@@ -547,6 +571,38 @@ prop_serialize
     }
   }
 }
+
+/**
+ *
+ */
+char *
+prop_md_doc(const char **doc, const char *lang)
+{
+  const char *s;
+  char *r = NULL;
+  size_t l = 0;
+
+  for (; *doc; doc++) {
+    if ((*doc)[0] == '\xff') {
+      if ((*doc)[1] == 1)
+        s = tvh_gettext_lang(lang, *doc + 2);
+      else
+        s = "";
+    } else {
+      s = *doc;
+    }
+    if (r == NULL) {
+      r = strdup(s);
+      l = strlen(s);
+    } else {
+      l += strlen(s) + 1;
+      r = realloc(r, l);
+      strcat(r, s);
+    }
+  }
+  return r;
+}
+
 
 /******************************************************************************
  * Editor Configuration

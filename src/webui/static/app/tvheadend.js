@@ -5,6 +5,18 @@ tvheadend.admin = false;
 tvheadend.dialog = null;
 tvheadend.uilevel = 'expert';
 tvheadend.uilevel_nochange = false;
+tvheadend.quicktips = true;
+tvheadend.wizard = null;
+tvheadend.docs_toc = null;
+tvheadend.doc_history = [];
+tvheadend.doc_win = null;
+tvheadend.language = window.navigator.userLanguage || window.navigator.language;
+
+// Use en-US if browser language detection fails.
+if (!tvheadend.language || !/\S/.test(tvheadend.language)) {
+    console.log('No browser language detected, using hard-coded en-US.');
+    tvheadend.language = "en-US";
+}
 
 tvheadend.cookieProvider = new Ext.state.CookieProvider({
   // 7 days from now
@@ -44,33 +56,210 @@ tvheadend.uilevel_match = function(target, current) {
     return true;
 }
 
+/*
+ * Select specific tab
+ */
+tvheadend.select_tab = function(id)
+{
+    var i = Ext.getCmp(id);
+    var c = i ? i.ownerCt : null;
+    while (c) {
+        if ('activeTab' in c) {
+            c.setActiveTab(i);
+        }
+        i = c;
+        c = c.ownerCt;
+    }
+}
+
 /**
  * Displays a help popup window
  */
-tvheadend.help = function(title, pagename) {
-    Ext.Ajax.request({
-        url: 'redir/docs/' + pagename,
-        success: function(result, request) {
+tvheadend.mdhelp = function(pagename) {
 
-            var content = new Ext.Panel({
-                autoScroll: true,
-                border: false,
-                layout: 'fit',
-                html: result.responseText
-            });
+    var parse = function(text) {
+        var renderer = new marked.Renderer;
+        renderer.link = function(href, title, text) {
+            var x = href.indexOf('#');
+            if (href.indexOf(':/') === -1 && (x === -1 || x > 1)) {
+                var r = '<a page="' + href + '"';
+                if (title) r += ' title="' + title + '"';
+                return r + '>' + text + '</a>';
+            }
+            return marked.Renderer.prototype.link.call(this, href, title, text);
+        };
+        renderer.image = function(href, title, text) {
+            if (href) {
+                if (href.substring(0, 7) == 'images/')
+                    href = 'static/img' + href.substring(6);
+                else if (href.substring(0, 6) == 'icons/')
+                    href = 'static/' + href;
+            }
+            return marked.Renderer.prototype.image.call(this, href, title, text);
+        };
+        renderer.heading = function(text, level, raw) {
+            var id = raw.toLowerCase().replace(/[^\w]+/g, '-');
+            return '<h' + level + ' id="' + this.options.headerPrefix + id +
+                   '"><a class="hts-doc-anchor" href="#' + id + '">' + text +
+                   '</a></h' + level + '>\n';
+        };
+        opts = { renderer: renderer, headerPrefix: 'tvh-doc-hdr-' };
+        return marked(text, opts);
+    }
 
-            var win = new Ext.Window({
-                title: _('Help for') + ' ' + title,
-                iconCls: 'help',
-                layout: 'fit',
-                width: 900,
-                height: 400,
-                constrainHeader: true,
-                items: [content]
-            });
-            win.show();
+    var fcn = function(result) {
+        var mdtext = result.responseText;
+        var title = mdtext.split('\n')[0].split('#');
+        var history = '';
 
+        if (tvheadend.doc_win) {
+            tvheadend.doc_win.close();
+            tvheadend.doc_win = null;
         }
+        
+        if (title)
+            title = title[title.length-1];
+
+        if (tvheadend.doc_history) {
+            for (var i = 1; i <= tvheadend.doc_history.length; i++) {
+                var p = tvheadend.doc_history[i-1];
+                if (!history)
+                    history = '## ' + _('Last Help Pages') + '\n\n';
+                history += '' + i + '. [' + p[1] + '](' + p[0] + ')\n';
+            }
+            history = parse(history);
+            if (history)
+                history += '<hr/>';
+        }
+        
+        var bodyid = Ext.id();
+        var text = '<div id="' + bodyid + '">';
+        if (tvheadend.docs_toc || history)
+            text += '<div class="hts-doc-toc">' + history + tvheadend.docs_toc + '</div>';
+        text += '<div class="hts-doc-text">' + parse(mdtext) + '</div>';
+        text += '</div>';
+
+        var content = new Ext.Panel({
+            autoScroll: true,
+            border: false,
+            layout: 'fit',
+            html: text
+        });
+
+        var doresize = function(win) {
+            var aw = Ext.lib.Dom.getViewWidth();
+            var ah = Ext.lib.Dom.getViewHeight();
+            var size = win.getSize();
+            var osize = [size.width, size.height];
+            var pos = win.getPosition();
+            var opos = pos;
+
+            if (pos[0] > -9000) {
+                if (pos[0] + size.width > aw)
+                    pos[0] = Math.max(0, aw - size.width);
+                if (pos[0] + size.width > aw)
+                    size.width = aw;
+                if (pos[1] + size.height > ah)
+                    pos[1] = Math.max(0, ah - size.height);
+                if (pos[1] + size.height > ah)
+                    size.height = ah;
+                if (pos != opos || osize[0] != size.width || osize[1] != size.height) {
+                  win.setPosition(pos);
+                  win.setSize(size);
+                }
+            }
+
+            var dom = win.getEl().dom;
+            var el = dom.querySelectorAll("img");
+            var maxwidth = '97%';
+            if (size.width >= 350)
+                maxwidth = '' + (size.width - 290) + 'px';
+            for (var i = 0; i < el.length; i++)
+                el[i].style['max-width'] = maxwidth;
+        }
+
+        var win = new Ext.Window({
+            title: _('Help for') + ' ' + title,
+            iconCls: 'help',
+            layout: 'fit',
+            width: 900,
+            height: 400,
+            constrainHeader: true,
+            items: [content],
+            listeners: {
+                render: function(win) {
+                    win.body.on('click', function(e, dom) {
+                        var page = dom.getAttribute('page');
+                        if (page) {
+                            tvheadend.mdhelp(page);
+                            return;
+                        }
+                        var href = dom.getAttribute('href');
+                        if (href.indexOf('#') !== -1) {
+                            var id = 'tvh-doc-hdr-' + href.substring(1);
+                            var el = document.getElementById(id);
+                            el.scrollIntoView();
+                            return;
+                        }
+                    });
+                },
+                afterrender: function(win) {
+                    doresize(win);
+                },
+                resize: function(win, width, height) {
+                    doresize(win);
+                },
+                destroy: function(win) {
+                    if (win == tvheadend.doc_win)
+                        tvheadend.doc_win = null;
+                    Ext.EventManager.removeResizeListener(doresize, this);
+                }
+            },
+        });
+        var aw = Ext.lib.Dom.getViewWidth();
+        var ah = Ext.lib.Dom.getViewHeight();
+        if (aw > 400) aw -= 50;
+        if (aw > 500) aw -= 50;
+        if (aw > 800) aw -= 100;
+        if (ah > 400) ah -= 50;
+        if (ah > 500) ah -= 50;
+        if (ah > 800) ah -= 100;
+        win.setSize(aw, ah);
+        Ext.EventManager.onWindowResize(function() { doresize(this); }, win, [true]);
+        win.show();
+        tvheadend.doc_history = [[pagename, title]].concat(tvheadend.doc_history);
+        if (tvheadend.doc_history.length > 5)
+           tvheadend.doc_history.pop();
+        tvheadend.doc_win = win;
+    }
+
+    var helpfailuremsg = function() { 
+        Ext.MessageBox.show({
+            title:_('Error'),
+            msg: _('There was a problem displaying the help page!') + '<br>' + 
+                 _('This usually means there is no help available or the document couldn\'t be loaded.'),
+            buttons: Ext.Msg.OK,
+            icon: Ext.MessageBox.ERROR,
+        });
+    }
+
+    Ext.Ajax.request({
+        url: 'markdown/' + pagename,
+        success: function(result) {
+            if (!tvheadend.docs_toc) {
+                Ext.Ajax.request({
+                    url: 'markdown/toc',
+                    success: function(result_toc) {
+                        tvheadend.docs_toc = parse(result_toc.responseText);
+                        fcn(result);
+                    },
+                    failure: helpfailuremsg,
+                });
+            } else {
+                fcn(result);
+            }
+        },
+        failure: helpfailuremsg,
     });
 };
 
@@ -242,9 +431,19 @@ Ext.Ajax.request({
  */
 tvheadend.niceDate = function(dt) {
     var d = new Date(dt);
-    return '<div class="x-nice-dayofweek">' + d.toLocaleString(window.navigator.language, {weekday: 'long'}) + '</div>' +
+    return '<div class="x-nice-dayofweek">' + d.toLocaleString(tvheadend.language, {weekday: 'long'}) + '</div>' +
            '<div class="x-nice-date">' + d.toLocaleDateString() + '</div>' +
            '<div class="x-nice-time">' + d.toLocaleTimeString() + '</div>';
+}
+
+/*
+ *
+ */
+tvheadend.playLink = function(link, title) {
+    if (title) title = '?title=' + encodeURIComponent(title);
+    return '<a href="' + link + title + '">' +
+           '<img src="static/icons/control_play.png" class="playlink" title="' +
+           _('Play this stream') + '" alt="' + _('Play') + '"/></a>';
 }
 
 /**
@@ -404,8 +603,8 @@ tvheadend.VideoPlayer = function(url) {
 };
 
 function diskspaceUpdate(o) {
-  if ('freediskspace' in o && 'totaldiskspace' in o)
-    tvheadend.rootTabPanel.setDiskSpace(o.freediskspace, o.totaldiskspace);
+  if ('freediskspace' in o && 'useddiskspace' in o && 'totaldiskspace' in o)
+    tvheadend.rootTabPanel.setDiskSpace(o.freediskspace, o.useddiskspace, o.totaldiskspace);
 }
 
 /**
@@ -423,6 +622,11 @@ function accessUpdate(o) {
 
     if (o.uilevel)
         tvheadend.uilevel = o.uilevel;
+        
+    if (o.theme)
+        tvheadend.theme = o.theme;
+        
+    tvheadend.quicktips = o.quicktips ? true : false;
 
     if (o.uilevel_nochange)
         tvheadend.uilevel_nochange = true;
@@ -433,8 +637,8 @@ function accessUpdate(o) {
         tvheadend.rootTabPanel.setLogin(o.username);
     if ('address' in o)
         tvheadend.rootTabPanel.setAddress(o.address);
-    if ('freediskspace' in o && 'totaldiskspace' in o)
-        tvheadend.rootTabPanel.setDiskSpace(o.freediskspace, o.totaldiskspace);
+    if ('freediskspace' in o && 'useddiskspace' in o && 'totaldiskspace' in o)
+        tvheadend.rootTabPanel.setDiskSpace(o.freediskspace, o.useddiskspace, o.totaldiskspace);
 
     if ('cookie_expires' in o && o.cookie_expires > 0)
         tvheadend.cookieProvider.expires =
@@ -560,7 +764,18 @@ function accessUpdate(o) {
             tvheadend.caclient(cp, 6);
 
         /* Debug */
-        tvheadend.tvhlog(cp, 7);
+        var dbg = new Ext.TabPanel({
+            tabIndex: 7,
+            activeTab: 0,
+            autoScroll: true,
+            title: _('Debugging'),
+            iconCls: 'debug',
+            items: []
+        });
+        tvheadend.tvhlog(dbg, 0);
+        tvheadend.memoryinfo(dbg, 1);
+
+        cp.add(dbg);
 
         /* Finish */
         tvheadend.rootTabPanel.add(cp);
@@ -586,6 +801,9 @@ function accessUpdate(o) {
     }
 
     tvheadend.rootTabPanel.doLayout();
+
+    if (o.wizard)
+        tvheadend.wizard_start(o.wizard);
 }
 
 /**
@@ -713,7 +931,7 @@ tvheadend.RootTabPanel = Ext.extend(Ext.TabPanel, {
             Ext.get(this.extra.login.tabEl).child('span.x-tab-strip-extra-comp', true).qtip = addr;
     },
 
-    setDiskSpace: function(bfree, btotal) {
+    setDiskSpace: function(bfree, bused, btotal) {
         if (!('storage' in this.extra)) return;
         human = function(val) {
           if (val > 1073741824)
@@ -724,10 +942,10 @@ tvheadend.RootTabPanel = Ext.extend(Ext.TabPanel, {
             val = parseInt(val / 1024) + _('KiB');
           return val;
         };
-        text = _('Storage space') + ':&nbsp;<b>' + human(bfree) + '/' + human(btotal) + '</b>';
+        text = _('Storage space') + ':&nbsp;<b>' + human(bfree) + '/' + human(bused) + '/' + human(btotal) + '</b>';
         var el = Ext.get(this.extra.storage.tabEl).child('span.x-tab-strip-extra-comp', true);
         el.innerHTML = text;
-        el.qtip = _('Free') + ': ' + human(bfree) + ' ' + _('Total') + ': ' + human(btotal);
+        el.qtip = _('Free') + ': ' + human(bfree) + ' ' + _('Used by tvheadend') + ': ' + human(bused) + ' ' + _('Total') + ': ' + human(btotal);
     },
 
     setTime: function(stime) {
@@ -784,7 +1002,7 @@ tvheadend.app = function() {
                         maxSize: 400,
                         collapsible: true,
                         collapsed: true,
-                        title: _('System log'),
+                        title: _('Tvheadend log'),
                         margins: '0 0 0 0',
                         tools: [{
                                 id: 'gear',

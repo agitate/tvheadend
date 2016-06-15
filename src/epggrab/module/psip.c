@@ -41,7 +41,7 @@ static int _psip_ett_callback(mpegts_table_t *mt, const uint8_t *ptr, int len, i
 typedef struct psip_table {
   TAILQ_ENTRY(psip_table) pt_link;
   mpegts_table_t         *pt_table;
-  time_t                  pt_start;
+  int64_t                 pt_start;
   uint16_t                pt_pid;
   uint16_t                pt_type;
   uint8_t                 pt_complete;
@@ -62,7 +62,7 @@ typedef struct psip_status {
   mpegts_mux_t            *ps_mm;
   TAILQ_HEAD(, psip_table) ps_tables;
   RB_HEAD(, psip_desc)     ps_descs;
-  gtimer_t                 ps_reschedule_timer;
+  mtimer_t                 ps_reschedule_timer;
   uint8_t                  ps_complete;
   uint8_t                  ps_armed;
 } psip_status_t;
@@ -87,7 +87,7 @@ psip_status_destroy ( mpegts_table_t *mt )
       free(pd->pd_data);
       free(pd);
     }
-    gtimer_disarm(&st->ps_reschedule_timer);
+    mtimer_disarm(&st->ps_reschedule_timer);
     free(st);
   } else {
     TAILQ_FOREACH(pt, &st->ps_tables, pt_link)
@@ -163,7 +163,7 @@ psip_activate_table(psip_status_t *ps, psip_table_t *pt)
   }
   ps->ps_refcount++;
   mt->mt_destroy = psip_status_destroy;
-  pt->pt_start = dispatch_clock;
+  pt->pt_start = mclk();
   pt->pt_table = mt;
   tvhtrace("psip", "table activated - pid 0x%04X type 0x%04X", mt->mt_pid, pt->pt_type);
   return mt;
@@ -203,7 +203,7 @@ psip_reschedule_tables(psip_status_t *ps)
   total = 0;
   TAILQ_FOREACH(pt, &ps->ps_tables, pt_link) {
     total++;
-    if (pt->pt_table && pt->pt_start + 10 < dispatch_clock) {
+    if (pt->pt_table && pt->pt_start + sec2mono(10) < mclk()) {
       tvhtrace("psip", "table late: pid = 0x%04X, type = 0x%04X\n", pt->pt_pid, pt->pt_type);
       mpegts_table_destroy(pt->pt_table);
       pt->pt_table = NULL;
@@ -222,7 +222,7 @@ psip_reschedule_tables(psip_status_t *ps)
 #if 0
   for (i = 0; i < total; i++) {
     pt = tables[i];
-    tvhtrace("psip", "sorted: pid = 0x%04X, type = 0x%04X, time = %"PRItime_t", complete %d\n",
+    tvhtrace("psip", "sorted: pid = 0x%04X, type = 0x%04X, time = %"PRId64", complete %d\n",
              pt->pt_pid, pt->pt_type, pt->pt_start, pt->pt_complete);
   }
 #endif
@@ -260,7 +260,7 @@ psip_complete_table(psip_status_t *ps, mpegts_table_t *mt)
   mpegts_table_destroy(mt);
 
   if (pt)
-    gtimer_arm(&ps->ps_reschedule_timer, psip_reschedule_tables_cb, ps, 0);
+    mtimer_arm_rel(&ps->ps_reschedule_timer, psip_reschedule_tables_cb, ps, 0);
 
   if (ps->ps_ota == NULL)
     return;
@@ -268,7 +268,7 @@ psip_complete_table(psip_status_t *ps, mpegts_table_t *mt)
   if (ps->ps_complete) {
     if (!ps->ps_armed) {
       ps->ps_armed = 1;
-      gtimer_arm(&ps->ps_reschedule_timer, psip_reschedule_tables_cb, ps, 10);
+      mtimer_arm_rel(&ps->ps_reschedule_timer, psip_reschedule_tables_cb, ps, sec2mono(10));
     }
     return;
   }
@@ -341,13 +341,14 @@ _psip_eit_callback_channel
   uint16_t eventid;
   uint32_t starttime, length;
   time_t start, stop;
-  int save = 0, save2, i, size;
+  int save = 0, save2, save3, i, size;
   uint8_t titlelen;
   unsigned int dlen;
   epg_broadcast_t *ebc;
   epg_episode_t *ee;
   lang_str_t *title, *description;
   psip_desc_t *pd;
+  uint32_t changes2, changes3;
   epggrab_module_t *mod = (epggrab_module_t *)ps->ps_mod;
 
   for (i = 0; len >= 12 && i < count; len -= size, ptr += size, i++) {
@@ -368,6 +369,9 @@ _psip_eit_callback_channel
     length = (ptr[6] & 0x0f) << 16 | ptr[7] << 8 | ptr[8];
     stop = start + length;
     titlelen = ptr[9];
+
+    if (12 + titlelen > len) break;
+
     dlen = ((ptr[10+titlelen] & 0x0f) << 8) | ptr[11+titlelen];
     size = titlelen + dlen + 12;
     tvhtrace("psip", "  %03d: titlelen %d, dlen %d", i, titlelen, dlen);
@@ -381,23 +385,34 @@ _psip_eit_callback_channel
              i, ch ? channel_get_name(ch) : "(null)", eventid, start, length,
              lang_str_get(title, NULL), titlelen);
 
-    ebc = epg_broadcast_find_by_time(ch, start, stop, eventid, 1, &save2);
+    save2 = save3 = changes2 = changes3 = 0;
+
+    ebc = epg_broadcast_find_by_time(ch, mod, start, stop, 1, &save2, &changes2);
     tvhtrace("psip", "  eid=%5d, start=%"PRItime_t", stop=%"PRItime_t", ebc=%p",
              eventid, start, stop, ebc);
     if (!ebc) goto next;
-    save |= save2;
+
+    save2 |= epg_broadcast_set_dvb_eid(ebc, eventid, &changes2);
 
     pd = psip_find_desc(ps, eventid);
     if (pd) {
       description = atsc_get_string(pd->pd_data, pd->pd_datalen);
       if (description) {
-        save |= epg_broadcast_set_description2(ebc, description, mod);
+        save2 |= epg_broadcast_set_description(ebc, description, &changes2);
         lang_str_destroy(description);
       }
     }
 
-    ee = epg_broadcast_get_episode(ebc, 1, &save2);
-    save |= epg_episode_set_title2(ee, title, mod);
+    ee = epg_episode_find_by_broadcast(ebc, mod, 1, &save3, &changes3);
+    if (ee) {
+      save2 |= epg_broadcast_set_episode(ebc, ee, &changes2);
+      save3 |= epg_episode_set_title(ee, title, &changes3);
+      save3 |= epg_episode_change_finish(ee, changes3, 0);
+    }
+
+    save |= epg_broadcast_change_finish(ebc, changes2, 0);
+
+    save |= save2 | save3;
 
 next:
     lang_str_destroy(title);
@@ -535,6 +550,7 @@ _psip_ett_callback
   lang_str_t *description;
   idnode_list_mapping_t *ilm;
   channel_t            *ch;
+  uint32_t              changes;
 
   /* Validate */
   if (tableid != 0xcc) return -1;
@@ -582,9 +598,11 @@ _psip_ett_callback
     LIST_FOREACH(ilm, &svc->s_channels, ilm_in1_link) {
       ch = (channel_t *)ilm->ilm_in2;
       epg_broadcast_t *ebc;
+      changes = 0;
       ebc = epg_broadcast_find_by_eid(ch, eventid);
-      if (ebc) {
-        save |= epg_broadcast_set_description2(ebc, description, mod);
+      if (ebc && ebc->grabber == mod) {
+        save |= epg_broadcast_set_description(ebc, description, &changes);
+        save |= epg_broadcast_change_finish(ebc, changes, 1);
         tvhtrace("psip", "0x%04x: ETT tableid 0x%04X [%s], eventid 0x%04X (%d) ['%s'], ver %d",
                  mt->mt_pid, tsid, svc->s_dvb_svcname, eventid, eventid,
                  lang_str_get(ebc->episode->title, "eng"), ver);

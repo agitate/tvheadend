@@ -28,13 +28,14 @@
  * Class definition
  * ***************************************************************************/
 
-static void
+static htsmsg_t *
 mpegts_network_class_save
-  ( idnode_t *in )
+  ( idnode_t *in, char *filename, size_t fsize )
 {
   mpegts_network_t *mn = (mpegts_network_t*)in;
   if (mn->mn_config_save)
-    mn->mn_config_save(mn);
+    return mn->mn_config_save(mn, filename, fsize);
+  return NULL;
 }
 
 static const char *
@@ -99,7 +100,7 @@ mpegts_network_class_get_num_chn ( void *ptr )
 static const void *
 mpegts_network_class_get_scanq_length ( void *ptr )
 {
-  static __thread int n;
+  static int n;
   mpegts_mux_t *mm;
   mpegts_network_t *mn = ptr;
 
@@ -128,10 +129,25 @@ mpegts_network_class_idlescan_notify ( void *p, const char *lang )
   }
 }
 
+static htsmsg_t *
+mpegts_network_discovery_enum ( void *o, const char *lang )
+{
+  static const struct strtab tab[] = {
+    { N_("Disable"),                  MN_DISCOVERY_DISABLE },
+    { N_("New muxes only"),           MN_DISCOVERY_NEW },
+    { N_("New muxes + changed muxes"), MN_DISCOVERY_CHANGE },
+  };
+  return strtab2htsmsg(tab, 1, lang);
+}
+
+CLASS_DOC(mpegts_network)
+PROP_DOC(network_discovery)
+
 const idclass_t mpegts_network_class =
 {
   .ic_class      = "mpegts_network",
-  .ic_caption    = N_("MPEG-TS network"),
+  .ic_caption    = N_("DVB Inputs - Networks"),
+  .ic_doc        = tvh_doc_mpegts_network_class,
   .ic_event      = "mpegts_network",
   .ic_perm_def   = ACCESS_ADMIN,
   .ic_save       = mpegts_network_class_save,
@@ -141,6 +157,7 @@ const idclass_t mpegts_network_class =
       .type     = PT_STR,
       .id       = "networkname",
       .name     = N_("Network name"),
+      .desc     = N_("Name of the network."),
       .off      = offsetof(mpegts_network_t, mn_network_name),
       .notify   = idnode_notify_title_changed,
     },
@@ -148,6 +165,7 @@ const idclass_t mpegts_network_class =
       .type     = PT_STR,
       .id       = "pnetworkname",
       .name     = N_("Provider network name"),
+      .desc     = N_("Provider's network name."),
       .off      = offsetof(mpegts_network_t, mn_provider_network_name),
       .opts     = PO_ADVANCED | PO_HIDDEN,
     },
@@ -155,21 +173,30 @@ const idclass_t mpegts_network_class =
       .type     = PT_U16,
       .id       = "nid",
       .name     = N_("Network ID (limit scanning)"),
+      .desc     = N_("Limited/limit scanning to this network ID only."),
       .opts     = PO_ADVANCED,
       .off      = offsetof(mpegts_network_t, mn_nid),
     },
     {
-      .type     = PT_BOOL,
+      .type     = PT_INT,
       .id       = "autodiscovery",
       .name     = N_("Network discovery"),
+      .desc     = N_("Discover more muxes using the Network "
+                     "Information Table (if available)."),
+      .doc      = prop_doc_network_discovery,
       .off      = offsetof(mpegts_network_t, mn_autodiscovery),
-      .opts     = PO_ADVANCED,
-      .def.i    = 1
+      .list     = mpegts_network_discovery_enum,
+      .opts     = PO_ADVANCED | PO_DOC_NLIST,
+      .def.i    = MN_DISCOVERY_NEW
     },
     {
       .type     = PT_BOOL,
       .id       = "skipinitscan",
       .name     = N_("Skip initial scan"),
+      .desc     = N_("Skip scanning known muxes when Tvheadend starts. "
+                     "If \"initial scan\" is allowed and new muxes are "
+                     "found then they will still be scanned. See Help for "
+                     "more details."),
       .off      = offsetof(mpegts_network_t, mn_skipinitscan),
       .opts     = PO_EXPERT,
       .def.i    = 1
@@ -178,6 +205,15 @@ const idclass_t mpegts_network_class =
       .type     = PT_BOOL,
       .id       = "idlescan",
       .name     = N_("Idle scan muxes"),
+      .desc     = N_("When nothing else is happening Tvheadend will "
+                     "continuously rotate among all muxes and tune to "
+                     "them to verify that they are still working when "
+                     "the inputs are not used for streaming. If your "
+                     "adapters have problems with lots of (endless) "
+                     "tuning, disable this. Note that this option "
+                     "should be OFF for the normal operation. This type "
+                     "of mux probing is not required and it may cause "
+                     "issues for SAT>IP (limited number of PID filters)."),
       .off      = offsetof(mpegts_network_t, mn_idlescan),
       .def.i    = 0,
       .notify   = mpegts_network_class_idlescan_notify,
@@ -187,6 +223,7 @@ const idclass_t mpegts_network_class =
       .type     = PT_BOOL,
       .id       = "sid_chnum",
       .name     = N_("Use service IDs as channel numbers"),
+      .desc     = N_("Use the provider's service IDs as channel numbers."),
       .off      = offsetof(mpegts_network_t, mn_sid_chnum),
       .opts     = PO_EXPERT,
       .def.i    = 0,
@@ -195,6 +232,7 @@ const idclass_t mpegts_network_class =
       .type     = PT_BOOL,
       .id       = "ignore_chnum",
       .name     = N_("Ignore provider's channel numbers"),
+      .desc     = N_("Don't use the provider's channel numbers."),
       .off      = offsetof(mpegts_network_t, mn_ignore_chnum),
       .opts     = PO_ADVANCED,
       .def.i    = 0,
@@ -204,6 +242,7 @@ const idclass_t mpegts_network_class =
       .type     = PT_U16,
       .id       = "satip_source",
       .name     = N_("SAT>IP source number"),
+      .desc     = N_("The SAT>IP source number."),
       .off      = offsetof(mpegts_network_t, mn_satip_source),
       .opts     = PO_ADVANCED
     },
@@ -212,21 +251,26 @@ const idclass_t mpegts_network_class =
       .type     = PT_STR,
       .id       = "charset",
       .name     = N_("Character set"),
+      .desc     = N_("The character encoding for this network "
+                     "(e.g. UTF-8)."),
       .off      = offsetof(mpegts_network_t, mn_charset),
       .list     = dvb_charset_enum,
-      .opts     = PO_ADVANCED,
+      .opts     = PO_ADVANCED | PO_DOC_NLIST,
     },
     {
-      .type     = PT_BOOL,
+      .type     = PT_INT,
       .id       = "localtime",
-      .name     = N_("EIT broadcast in local time"),
+      .name     = N_("EIT time offset"),
+      .desc     = N_("Select the time offset for EIT events."),
       .off      = offsetof(mpegts_network_t, mn_localtime),
-      .opts     = PO_EXPERT,
+      .list     = dvb_timezone_enum,
+      .opts     = PO_EXPERT | PO_DOC_NLIST,
     },
     {
       .type     = PT_INT,
       .id       = "num_mux",
       .name     = N_("# Muxes"),
+      .desc     = N_("Total number of muxes found on this network."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_network_class_get_num_mux,
     },
@@ -234,6 +278,7 @@ const idclass_t mpegts_network_class =
       .type     = PT_INT,
       .id       = "num_svc",
       .name     = N_("# Services"),
+      .desc     = N_("Total number of services found on this network."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_network_class_get_num_svc,
     },
@@ -241,6 +286,7 @@ const idclass_t mpegts_network_class =
       .type     = PT_INT,
       .id       = "num_chn",
       .name     = N_("# Mapped channels"),
+      .desc     = N_("Total number of mapped channels on this network."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_network_class_get_num_chn,
     },
@@ -248,8 +294,16 @@ const idclass_t mpegts_network_class =
       .type     = PT_INT,
       .id       = "scanq_length",
       .name     = N_("Scan queue length"),
+      .desc     = N_("The number of muxes left to scan on this network."),
       .opts     = PO_RDONLY | PO_NOSAVE,
       .get      = mpegts_network_class_get_scanq_length,
+    },
+    {
+       .type     = PT_BOOL,
+       .id       = "wizard",
+       .name     = N_("Wizard"),
+       .off      = offsetof(mpegts_network_t, mn_wizard),
+       .opts     = PO_NOUI
     },
     {}
   }
@@ -266,11 +320,12 @@ mpegts_network_display_name
   strncpy(buf, mn->mn_network_name ?: "unknown", len);
 }
 
-static void
+static htsmsg_t *
 mpegts_network_config_save
-  ( mpegts_network_t *mn )
+  ( mpegts_network_t *mn, char *filename, size_t size )
 {
   // Nothing - leave to child classes
+  return NULL;
 }
 
 static mpegts_mux_t *
@@ -319,6 +374,8 @@ mpegts_network_delete
   mpegts_mux_t *mm;
   mpegts_network_link_t *mnl;
 
+  idnode_save_check(&mn->mn_id, delconf);
+
   /* Remove from global list */
   LIST_REMOVE(mn, mn_global_link);
 
@@ -328,7 +385,7 @@ mpegts_network_delete
   }
 
   /* Disarm scanning */
-  gtimer_disarm(&mn->mn_scan_timer);
+  mtimer_disarm(&mn->mn_scan_timer);
 
   /* Remove from input */
   while ((mnl = LIST_FIRST(&mn->mn_inputs)))
@@ -378,10 +435,12 @@ mpegts_network_create0
   /* Initialise scanning */
   TAILQ_INIT(&mn->mn_scan_pend);
   TAILQ_INIT(&mn->mn_scan_active);
-  gtimer_arm(&mn->mn_scan_timer, mpegts_network_scan_timer_cb, mn, 0);
+  mtimer_arm_rel(&mn->mn_scan_timer, mpegts_network_scan_timer_cb, mn, 0);
 
   /* Defaults */
   mn->mn_satpos = INT_MAX;
+  mn->mn_skipinitscan = 1;
+  mn->mn_autodiscovery = MN_DISCOVERY_NEW;
 
   /* Load config */
   if (conf)
@@ -449,6 +508,82 @@ mpegts_network_scan ( mpegts_network_t *mn )
     mpegts_mux_scan_state_set(mm, MM_SCAN_STATE_PEND);
 }
 
+void
+mpegts_network_get_type_str( mpegts_network_t *mn, char *buf, size_t buflen )
+{
+  const char *s = "IPTV";
+#if ENABLE_MPEGTS_DVB
+  dvb_fe_type_t ftype;
+  ftype = dvb_fe_type_by_network_class(mn->mn_id.in_class);
+  if (ftype != DVB_TYPE_NONE)
+    s = dvb_type2str(ftype);
+#endif
+  snprintf(buf, buflen, "%s", s);
+}
+
+/******************************************************************************
+ * Wizard
+ *****************************************************************************/
+
+htsmsg_t *
+mpegts_network_wizard_get
+  ( mpegts_input_t *mi, const idclass_t *idc,
+    mpegts_network_t *mn, const char *lang )
+{
+  htsmsg_t *m = htsmsg_create_map(), *l, *e;
+  char ubuf[UUID_HEX_SIZE], buf[256];
+
+  if (mi && idc) {
+    mi->mi_display_name(mi, buf, sizeof(buf));
+    htsmsg_add_str(m, "input_name", buf);
+    l = htsmsg_create_list();
+    e = htsmsg_create_map();
+    htsmsg_add_str(e, "key", idc->ic_class);
+    htsmsg_add_str(e, "val", idclass_get_caption(idc, lang));
+    htsmsg_add_msg(l, NULL, e);
+    htsmsg_add_msg(m, "mpegts_network_types", l);
+    if (mn)
+      htsmsg_add_str(m, "mpegts_network", idnode_uuid_as_str(&mn->mn_id, ubuf));
+  }
+  return m;
+}
+
+void
+mpegts_network_wizard_create
+  ( const char *clazz, htsmsg_t **nlist, const char *lang )
+{
+  char buf[256];
+  mpegts_network_t *mn;
+  mpegts_network_builder_t *mnb;
+  htsmsg_t *conf;
+
+  if (nlist)
+    *nlist = NULL;
+
+  mnb = mpegts_network_builder_find(clazz);
+  if (mnb == NULL)
+    return;
+
+  /* only one network per type */
+  LIST_FOREACH(mn, &mpegts_network_all, mn_global_link)
+    if (mn->mn_id.in_class == mnb->idc && mn->mn_wizard)
+      goto found;
+
+  conf = htsmsg_create_map();
+  htsmsg_add_str(conf, "networkname", idclass_get_caption(mnb->idc, lang));
+  htsmsg_add_bool(conf, "wizard", 1);
+  mn = mnb->build(mnb->idc, conf);
+  htsmsg_destroy(conf);
+  if (mn)
+    idnode_changed(&mn->mn_id);
+
+found:
+  if (mn && nlist) {
+    *nlist = htsmsg_create_list();
+    htsmsg_add_str(*nlist, NULL, idnode_uuid_as_str(&mn->mn_id, buf));
+  }
+}
+
 /******************************************************************************
  * Network classes/creation
  *****************************************************************************/
@@ -464,6 +599,7 @@ mpegts_network_register_builder
   mnb->idc   = idc;
   mnb->build = build;
   LIST_INSERT_HEAD(&mpegts_network_builders, mnb, link);
+  idclass_register(idc);
 }
 
 void
@@ -480,15 +616,28 @@ mpegts_network_unregister_builder
   }
 }
 
+mpegts_network_builder_t *
+mpegts_network_builder_find
+  ( const char *clazz )
+{
+  mpegts_network_builder_t *mnb;
+  if (clazz == NULL)
+    return NULL;
+  LIST_FOREACH(mnb, &mpegts_network_builders, link) {
+    if (!strcmp(mnb->idc->ic_class, clazz))
+      return mnb;
+  }
+  return NULL;
+}
+
 mpegts_network_t *
 mpegts_network_build
   ( const char *clazz, htsmsg_t *conf )
 {
   mpegts_network_builder_t *mnb;
-  LIST_FOREACH(mnb, &mpegts_network_builders, link) {
-    if (!strcmp(mnb->idc->ic_class, clazz))
-      return mnb->build(mnb->idc, conf);
-  }
+  mnb = mpegts_network_builder_find(clazz);
+  if (mnb)
+    return mnb->build(mnb->idc, conf);
   return NULL;
 }
 
@@ -498,13 +647,15 @@ mpegts_network_build
 
 mpegts_mux_t *
 mpegts_network_find_mux
-  ( mpegts_network_t *mn, uint16_t onid, uint16_t tsid )
+  ( mpegts_network_t *mn, uint16_t onid, uint16_t tsid, int check )
 {
   mpegts_mux_t *mm;
   LIST_FOREACH(mm, &mn->mn_muxes, mm_network_link) {
     if (mm->mm_onid && onid && mm->mm_onid != onid) continue;
-    if (mm->mm_tsid == tsid && mm->mm_enabled)
-      break;
+    if (mm->mm_tsid == tsid) {
+      if (!check || mm->mm_enabled == MM_ENABLE)
+        break;
+    }
   }
   return mm;
 }
