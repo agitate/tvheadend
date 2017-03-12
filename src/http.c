@@ -256,15 +256,16 @@ static char *
 http_get_nonce(void)
 {
   struct http_nonce *n = calloc(1, sizeof(*n));
-  char stamp[32], *m;
+  char stamp[33], *m;
   int64_t mono;
 
   while (1) {
     mono = getmonoclock();
-    mono ^= 0xa1687211885fcd30;
+    mono ^= 0xa1687211885fcd30LL;
     snprintf(stamp, sizeof(stamp), "%"PRId64, mono);
     m = md5sum(stamp, 1);
-    strcpy(n->nonce, m);
+    strncpy(n->nonce, m, sizeof(stamp));
+    n->nonce[sizeof(stamp)-1] = '\0';
     pthread_mutex_lock(&global_lock);
     if (RB_INSERT_SORTED(&http_nonces, n, link, http_nonce_cmp)) {
       pthread_mutex_unlock(&global_lock);
@@ -336,7 +337,7 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
     if (config.cors_origin && config.cors_origin[0]) {
       htsbuf_qprintf(&hdrs, "Access-Control-Allow-Origin: %s\r\n", config.cors_origin);
       htsbuf_append_str(&hdrs, "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n");
-      htsbuf_append_str(&hdrs, "Access-Control-Allow-Headers: x-requested-with\r\n");
+      htsbuf_append_str(&hdrs, "Access-Control-Allow-Headers: x-requested-with,authorization\r\n");
     }
   }
   
@@ -429,7 +430,7 @@ http_send_header(http_connection_t *hc, int rc, const char *content,
     TAILQ_FOREACH(ra, args, link) {
       if (strcmp(ra->key, "Session") == 0)
         sess = 1;
-      htsbuf_qprintf(&hdrs, "%s: %s\r\n", ra->key, ra->val);
+      htsbuf_qprintf(&hdrs, "%s: %s\r\n", ra->key, ra->val ?: "");
     }
   }
   if(hc->hc_session && !sess)
@@ -562,7 +563,7 @@ http_error(http_connection_t *hc, int error)
       level = LOG_DEBUG;
     else if (error == HTTP_STATUS_BAD_REQUEST || error > HTTP_STATUS_UNAUTHORIZED)
       level = LOG_ERR;
-    tvhlog(level, "http", "%s: %s %s %s -- %d",
+    tvhlog(level, LS_HTTP, "%s: %s %s %s -- %d",
 	   hc->hc_peer_ipstr, http_ver2str(hc->hc_version),
            http_cmd2str(hc->hc_cmd), hc->hc_url, error);
   }
@@ -637,8 +638,10 @@ http_redirect(http_connection_t *hc, const char *location,
         htsbuf_append(&hq, "?", 1);
       first = 0;
       htsbuf_append_and_escape_url(&hq, ra->key);
-      htsbuf_append(&hq, "=", 1);
-      htsbuf_append_and_escape_url(&hq, ra->val);
+      if (ra->val) {
+        htsbuf_append(&hq, "=", 1);
+        htsbuf_append_and_escape_url(&hq, ra->val);
+      }
     }
     loc = htsbuf_to_string(&hq);
     htsbuf_queue_flush(&hq);
@@ -699,7 +702,7 @@ http_get_hostpath(http_connection_t *hc)
   proto = http_arg_get(&hc->hc_args, "X-Forwarded-Proto");
 
   snprintf(buf, sizeof(buf), "%s://%s%s",
-           proto ?: "http", host, tvheadend_webroot ?: "");
+           proto ?: "http", host ?: "localhost", tvheadend_webroot ?: "");
 
   return strdup(buf);
 }
@@ -718,8 +721,8 @@ http_access_verify_ticket(http_connection_t *hc)
   hc->hc_access = access_ticket_verify2(ticket_id, hc->hc_url);
   if (hc->hc_access == NULL)
     return;
-  tvhlog(LOG_INFO, "http", "%s: using ticket %s for %s",
-	 hc->hc_peer_ipstr, ticket_id, hc->hc_url);
+  tvhinfo(LS_HTTP, "%s: using ticket %s for %s",
+	  hc->hc_peer_ipstr, ticket_id, hc->hc_url);
 }
 
 /**
@@ -890,8 +893,10 @@ http_access_verify_channel(http_connection_t *hc, int mask,
 
   if (res) {
     access_destroy(hc->hc_access);
-    if (http_verify_prepare(hc, &v))
+    if (http_verify_prepare(hc, &v)) {
+      hc->hc_access = NULL;
       return -1;
+    }
     hc->hc_access = access_get((struct sockaddr *)hc->hc_peer, hc->hc_username,
                                http_verify_callback, &v);
     http_verify_free(&v);
@@ -957,7 +962,7 @@ dump_request(http_connection_t *hc)
   if (!first)
     tvh_strlcatf(buf, sizeof(buf), ptr, "}}");
 
-  tvhtrace("http", "%s %s %s%s", http_ver2str(hc->hc_version),
+  tvhtrace(LS_HTTP, "%s %s %s%s", http_ver2str(hc->hc_version),
            http_cmd2str(hc->hc_cmd), hc->hc_url, buf);
 }
 
@@ -967,8 +972,10 @@ dump_request(http_connection_t *hc)
 static int
 http_cmd_options(http_connection_t *hc)
 {
+  pthread_mutex_lock(&hc->hc_fd_lock);
   http_send_header(hc, HTTP_STATUS_OK, NULL, INT64_MIN,
 		   NULL, NULL, -1, 0, NULL, NULL);
+  pthread_mutex_unlock(&hc->hc_fd_lock);
   return 0;
 }
 
@@ -1145,6 +1152,8 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
         if((n = http_tokenize(authbuf, argv, 2, ':')) == 2) {
           hc->hc_username = tvh_strdupa(argv[0]);
           hc->hc_password = tvh_strdupa(argv[1]);
+          http_deescape(hc->hc_username);
+          http_deescape(hc->hc_password);
           // No way to actually track this
         }
       } else if (strcasecmp(argv[0], "digest") == 0) {
@@ -1159,6 +1168,7 @@ process_request(http_connection_t *hc, htsbuf_queue_t *spill)
         v = http_get_header_value(argv[1], "username");
         hc->hc_authhdr  = tvh_strdupa(argv[1]);
         hc->hc_username = tvh_strdupa(v);
+        http_deescape(hc->hc_username);
         free(v);
       } else {
         http_error(hc, HTTP_STATUS_BAD_REQUEST);
@@ -1238,16 +1248,20 @@ char *
 http_arg_get_remove(struct http_arg_list *list, const char *name)
 {
   static char __thread buf[128];
+  int empty;
   http_arg_t *ra;
   TAILQ_FOREACH(ra, list, link)
     if(!strcasecmp(ra->key, name)) {
       TAILQ_REMOVE(list, ra, link);
-      strncpy(buf, ra->val, sizeof(buf)-1);
-      buf[sizeof(buf)-1] = '\0';
+      empty = ra->val == NULL;
+      if (!empty) {
+        strncpy(buf, ra->val, sizeof(buf)-1);
+        buf[sizeof(buf)-1] = '\0';
+      }
       free(ra->key);
       free(ra->val);
       free(ra);
-      return buf;
+      return !empty ? buf : NULL;
     }
   buf[0] = '\0';
   return buf;
@@ -1265,7 +1279,7 @@ http_arg_set(struct http_arg_list *list, const char *key, const char *val)
   ra = malloc(sizeof(http_arg_t));
   TAILQ_INSERT_TAIL(list, ra, link);
   ra->key = strdup(key);
-  ra->val = strdup(val);
+  ra->val = val ? strdup(val) : NULL;
 }
 
 /*
@@ -1398,17 +1412,25 @@ http_parse_args(http_arg_list_t *list, char *args)
     args++;
   while(args) {
     k = args;
-    if((args = strchr(args, '=')) == NULL)
-      break;
-    *args++ = 0;
+    if((args = strchr(args, '=')) != NULL) {
+      *args++ = 0;
+    } else {
+      args = k;
+    }
+
     v = args;
     args = strchr(args, '&');
-
     if(args != NULL)
       *args++ = 0;
+    else if(v == k) {
+      if (*k == '\0')
+        break;
+      v = NULL;
+    }
 
     http_deescape(k);
-    http_deescape(v);
+    if (v)
+      http_deescape(v);
     //    printf("%s = %s\n", k, v);
     http_arg_set(list, k, v);
   }
@@ -1554,7 +1576,7 @@ http_server_init(const char *bindaddr)
     .cancel = http_cancel
   };
   RB_INIT(&http_nonces);
-  http_server = tcp_server_create("http", "HTTP", bindaddr, tvheadend_webui_port, &ops, NULL);
+  http_server = tcp_server_create(LS_HTTP, "HTTP", bindaddr, tvheadend_webui_port, &ops, NULL);
   atomic_set(&http_server_running, 1);
 }
 

@@ -303,6 +303,7 @@ typedef struct service {
   int s_auto;
   int s_prio;
   int s_type_user;
+  int s_pts_shift; // in ms (may be negative)
 
   LIST_ENTRY(service) s_active_link;
 
@@ -332,6 +333,8 @@ typedef struct service {
   int (*s_satip_source)(struct service *t);
 
   void (*s_memoryinfo)(struct service *t, int64_t *size);
+
+  int (*s_unseen)(struct service *t, const char *type, time_t before);
 
   /**
    * Channel info
@@ -455,6 +458,7 @@ typedef struct service {
    * Descrambling support
    */
 
+  uint16_t s_dvb_forcecaid;
   struct th_descrambler_list s_descramblers;
   uint8_t s_scrambled_seen;
   uint8_t s_scrambled_pass;
@@ -618,6 +622,8 @@ htsmsg_t *servicetype_list (void);
 void service_load ( service_t *s, htsmsg_t *c );
 
 void service_save ( service_t *s, htsmsg_t *c );
+
+void service_remove_unseen(const char *type, int days);
 
 void sort_elementary_streams(service_t *t);
 
