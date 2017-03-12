@@ -660,6 +660,22 @@ dvr_entry_get_episode(epg_broadcast_t *bcast, char *buf, int len)
 }
 
 /**
+ * Get episode uri
+ */
+static char *
+dvr_entry_get_episode_uri(epg_broadcast_t *bcast, char *buf, int len)
+{
+  // Check we have all the required structures
+  if (!bcast || !bcast->episode || !bcast->episode->uri)
+    return NULL;
+  // The tvh scheme is internal. We only want ones defined in EPG data. 
+  if (strncasecmp(bcast->episode->uri, "tvh://", 6) == 0)
+    return NULL;
+  strncpy(buf, bcast->episode->uri, len);
+  return buf;
+}
+
+/**
  * Find dvr entry using 'fuzzy' search
  */
 static int
@@ -828,6 +844,8 @@ dvr_entry_create_(int enabled, const char *config_uuid, epg_broadcast_t *e,
       lang_str_serialize(e->episode->summary, conf, "description");
     if (e->episode && (s = dvr_entry_get_episode(e, tbuf, sizeof(tbuf))))
       htsmsg_add_str(conf, "episode", s);
+    if (e->episode && (s = dvr_entry_get_episode_uri(e, tbuf, sizeof(tbuf))))
+      htsmsg_add_str(conf, "episode_uri", s);
   } else if (title) {
     l = lang_str_create();
     lang_str_add(l, title, lang, 0);
@@ -1326,6 +1344,7 @@ dvr_entry_dec_ref(dvr_entry_t *de)
   dvr_entry_assign_broadcast(de, NULL);
   free(de->de_channel_name);
   free(de->de_episode);
+  free(de->de_episode_uri);
 
   free(de);
 }
@@ -1459,6 +1478,7 @@ dvr_timer_remove_files(void *aux)
 #define DVR_UPDATED_BROADCAST    (1<<15)
 #define DVR_UPDATED_EPISODE      (1<<16)
 #define DVR_UPDATED_CONFIG       (1<<17)
+#define DVR_UPDATED_EPISODE_URI  (1<<18)
 
 static char *dvr_updated_str(char *buf, size_t buflen, int flags)
 {
@@ -1625,6 +1645,15 @@ static dvr_entry_t *_dvr_entry_update
     free(de->de_episode);
     de->de_episode = strdup(buf);
     save |= DVR_UPDATED_EPISODE;
+  }
+  
+  /* Episode uri */
+  if (!dvr_entry_get_episode_uri(de->de_bcast, buf, sizeof(buf)))
+    buf[0] = '\0';
+  if (strcmp(de->de_episode_uri ?: "", buf)) {
+    free(de->de_episode_uri);
+    de->de_episode_uri = strdup(buf);
+    save |= DVR_UPDATED_EPISODE_URI;
   }
 
   /* Save changes */
@@ -3193,6 +3222,14 @@ const idclass_t dvr_entry_class = {
       .name     = N_("Episode"),
       .desc     = N_("Episode number/ID."),
       .off      = offsetof(dvr_entry_t, de_episode),
+      .opts     = PO_RDONLY | PO_HIDDEN,
+    },
+    {
+      .type     = PT_STR,
+      .id       = "episode_uri",
+      .name     = N_("Episode URI"),
+      .desc     = N_("The episode URI of type dd_progid."),
+      .off      = offsetof(dvr_entry_t, de_episode_uri),
       .opts     = PO_RDONLY | PO_HIDDEN,
     },
     {

@@ -930,6 +930,8 @@ htsp_build_dvrentry(htsp_connection_t *htsp, dvr_entry_t *de, const char *method
     htsmsg_add_str(out, "description", s);
   if(de->de_episode)
     htsmsg_add_str(out, "episode", de->de_episode);
+  if(de->de_episode_uri)
+    htsmsg_add_str(out, "episode_uri", de->de_episode_uri);
   if(de->de_owner)
     htsmsg_add_str(out, "owner",   de->de_owner);
   if(de->de_creator)
